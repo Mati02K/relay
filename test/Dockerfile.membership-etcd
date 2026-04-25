@@ -1,0 +1,27 @@
+FROM golang:1.24-alpine AS builder
+
+# Install protoc and Go protoc plugins for generating gRPC stubs.
+RUN apk add --no-cache protobuf && \
+    go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+WORKDIR /build
+
+COPY proto/ ./proto/
+COPY src/membership/etcd-go/ .
+
+# Generate Go stubs into ./membership/ then build the binary.
+RUN mkdir -p membership && \
+    protoc \
+        -I proto \
+        --go_out=membership \
+        --go_opt=paths=source_relative \
+        --go-grpc_out=membership \
+        --go-grpc_opt=paths=source_relative \
+        proto/relay.proto && \
+    go mod tidy && \
+    go build -o membership-etcd .
+
+FROM alpine:3.19
+COPY --from=builder /build/membership-etcd /usr/local/bin/membership-etcd
+CMD ["membership-etcd"]

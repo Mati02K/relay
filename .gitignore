@@ -1,0 +1,31 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+src/*.egg-info/
+dist/
+build/
+
+# Generated gRPC stubs — regenerate with `make proto`
+src/membership/relay_pb2.py
+src/membership/relay_pb2_grpc.py
+src/membership/etcd-go/membership/
+
+# Logs
+logs/
+
+# Go
+src/membership/etcd-go/membership-etcd
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json

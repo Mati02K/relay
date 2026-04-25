@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package relay;
+
+option go_package = "relay/membership-etcd/membership";
+
+service MembershipService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Deregister(NodeIdRequest) returns (Empty);
+  rpc GetAliveMembers(Empty) returns (MemberList);
+  rpc WatchMembership(Empty) returns (stream MemberEvent);
+  rpc Put(KVPair) returns (Empty);
+  rpc Get(KeyRequest) returns (ValueResponse);
+  rpc GetByPrefix(KeyRequest) returns (KVList);
+  // Hold open while this node is the elected leader; server resigns when stream closes.
+  rpc HoldLeadership(Empty) returns (stream LeaderStatus);
+}
+
+
+message RegisterRequest {
+  string node_id = 1;
+  string metadata_json = 2;
+}
+
+message RegisterResponse {
+  bool success = 1;
+}
+
+message NodeIdRequest {
+  string node_id = 1;
+}
+
+message Node {
+  string id = 1;
+  string metadata_json = 2;
+}
+
+message MemberList {
+  repeated Node nodes = 1;
+}
+
+message MemberEvent {
+  enum Type {
+    JOINED = 0;
+    LEFT = 1;
+  }
+  Type type = 1;
+  Node node = 2;
+}
+
+message KVPair {
+  string key = 1;
+  string value = 2;
+}
+
+message KeyRequest {
+  string key = 1;
+}
+
+message ValueResponse {
+  string value = 1;
+  bool found = 2;
+}
+
+message KVList {
+  repeated KVPair items = 1;
+}
+
+message LeaderStatus {
+  bool is_leader = 1;
+  string leader_id = 2;
+}
+
+message Empty {}

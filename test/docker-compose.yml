@@ -1,0 +1,144 @@
+# Two-node cluster: each node runs a coordinator + worker on the management network.
+# etcd Raft cluster is shared. Only the elected coordinator serves requests.
+# Workers discover the active coordinator via etcd and proxy requests to it.
+
+networks:
+  management:
+    driver: bridge
+
+services:
+
+  # --- 3-node etcd cluster ---
+
+  etcd-1:
+    image: gcr.io/etcd-development/etcd:v3.5.14
+    networks: [management]
+    environment:
+      ETCD_NAME: etcd-1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-1:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-1:2379
+      ETCD_INITIAL_CLUSTER: >-
+        etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: relay-etcd-cluster
+
+  etcd-2:
+    image: gcr.io/etcd-development/etcd:v3.5.14
+    networks: [management]
+    environment:
+      ETCD_NAME: etcd-2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-2:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-2:2379
+      ETCD_INITIAL_CLUSTER: >-
+        etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: relay-etcd-cluster
+
+  etcd-3:
+    image: gcr.io/etcd-development/etcd:v3.5.14
+    networks: [management]
+    environment:
+      ETCD_NAME: etcd-3
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd-3:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-3:2379
+      ETCD_INITIAL_CLUSTER: >-
+        etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: relay-etcd-cluster
+
+  # --- Go gRPC membership server (shared) ---
+
+  membership-etcd:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.membership-etcd
+    networks: [management]
+    environment:
+      ETCD_ENDPOINTS: etcd-1:2379,etcd-2:2379,etcd-3:2379
+      GRPC_PORT: "50051"
+      NODE_ID: membership-etcd-server
+    depends_on: [etcd-1, etcd-2, etcd-3]
+    ports:
+      - "50051:50051"
+
+  # --- Node 1: coordinator-1 + worker-1 ---
+
+  coordinator-1:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.coordinator
+    networks: [management]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    environment:
+      MEMBERSHIP_HOST: membership-etcd
+      MEMBERSHIP_PORT: "50051"
+      NODE_ID: coordinator-1
+      COORDINATOR_HOST: coordinator-1
+      COORDINATOR_PORT: "8080"
+    env_file: ../.env
+    depends_on: [membership-etcd]
+    ports:
+      - "8081:8080"
+
+  worker-1:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.worker
+    networks: [management]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    environment:
+      MEMBERSHIP_HOST: membership-etcd
+      MEMBERSHIP_PORT: "50051"
+      NODE_ID: worker-1
+    env_file: ../.env
+    depends_on: [membership-etcd]
+    ports:
+      - "9091:9090"
+
+  # --- Node 2: coordinator-2 + worker-2 ---
+
+  coordinator-2:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.coordinator
+    networks: [management]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    environment:
+      MEMBERSHIP_HOST: membership-etcd
+      MEMBERSHIP_PORT: "50051"
+      NODE_ID: coordinator-2
+      COORDINATOR_HOST: coordinator-2
+      COORDINATOR_PORT: "8080"
+    env_file: ../.env
+    depends_on: [membership-etcd]
+    ports:
+      - "8082:8080"
+
+  worker-2:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.worker
+    networks: [management]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    environment:
+      MEMBERSHIP_HOST: membership-etcd
+      MEMBERSHIP_PORT: "50051"
+      NODE_ID: worker-2
+    env_file: ../.env
+    depends_on: [membership-etcd]
+    ports:
+      - "9092:9090"

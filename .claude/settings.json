@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "WebFetch(*)",
+      "WebSearch"
+    ],
+    "deny": [
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(sudo rm*)",
+      "Bash(dd if=*)",
+      "Bash(mkfs*)",
+      "Bash(:(){ :|:& };:*)",
+      "Bash(chmod -R 777 /*)",
+      "Bash(> /etc/passwd*)",
+      "Bash(curl * | bash*)",
+      "Bash(wget * | bash*)",
+      "Bash(sudo dd*)",
+      "Bash(shred*)",
+      "Bash(fdisk*)",
+      "Bash(format*)"
+    ]
+  },
+  "defaultMode": "auto"
+}

@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+# Install Tailscale using the official install script.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL https://tailscale.com/install.sh | sh && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml .
+COPY src/ ./src/
+COPY proto/ ./proto/
+
+# Install uv, then install Python deps and generate gRPC stubs inside the image.
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system -e "." grpcio-tools && \
+    python -m grpc_tools.protoc \
+        -I proto \
+        --python_out=src/membership \
+        --grpc_python_out=src/membership \
+        proto/relay.proto && \
+    sed -i 's/^import relay_pb2/from . import relay_pb2/' src/membership/relay_pb2_grpc.py
+
+COPY test/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["uvicorn", "coordinator.main:app", "--host", "0.0.0.0", "--port", "8080"]
