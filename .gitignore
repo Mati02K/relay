@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+venv/
 *.egg-info/
 src/*.egg-info/
 dist/
@@ -15,6 +16,9 @@ build/
 src/membership/relay_pb2.py
 src/membership/relay_pb2_grpc.py
 src/membership/etcd-go/membership/
+
+# Model files
+*.gguf
 
 # Logs
 logs/
