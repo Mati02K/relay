@@ -3,14 +3,18 @@ import json
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import Any, AsyncGenerator, AsyncIterator
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
 import logger as loggerSetup
+from coordinator.scheduler import SchedulingError, choose_worker
+from coordinator.worker_registry import fetch_worker_snapshots
 from membership.etcd import EtcdMembership
 from network.tailscale import TailscaleNetwork
 
@@ -83,10 +87,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         host=os.getenv("MEMBERSHIP_HOST", "localhost"),
         port=int(os.getenv("MEMBERSHIP_PORT", "50051")),
     )
-    networkLayer = TailscaleNetwork()
-
-    myAddress = networkLayer.getMyAddress()
-    myAddr = f"http://{os.getenv('COORDINATOR_HOST', myAddress)}:{COORDINATOR_PORT}"
+    configuredHost = os.getenv("COORDINATOR_HOST")
+    myAddress = configuredHost or TailscaleNetwork().getMyAddress()
+    myAddr = f"http://{myAddress}:{COORDINATOR_PORT}"
     log.info("Coordinator starting | addr={}", myAddr)
 
     await membershipClient.register(NODE_ID, {"role": "coordinator", "ip": myAddress})
@@ -146,26 +149,112 @@ async def chat(request: ChatRequest) -> ChatResponse:
     return ChatResponse(id=msgId, stored=True)
 
 
-@app.get("/v1/messages", response_model=dict)
-async def listMessages() -> dict:
+@app.post("/v1/chat/completions")
+async def chatCompletions(request: Request) -> StreamingResponse:
+    """Schedule and stream an OpenAI-compatible chat completion from a worker."""
+    _requireActive()
+    assert membershipClient is not None
+
+    raw_body = await request.json()
+    if not isinstance(raw_body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    body: dict[str, object] = {}
+    for key, value in raw_body.items():
+        if not isinstance(key, str):
+            raise HTTPException(status_code=400, detail="Request body keys must be strings")
+        body[key] = value
+
+    workers = await fetch_worker_snapshots(membershipClient)
+    try:
+        choice = choose_worker(body, workers)
+    except SchedulingError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    logger.info(
+        "Scheduled chat completion | worker={} matchedTokens={} uncachedTokens={} cost={:.3f}",
+        choice.worker.node_id,
+        choice.matched_tokens,
+        choice.uncached_prompt_tokens,
+        choice.cost,
+    )
+
+    client, stream_ctx, upstream = await _openWorkerStream(
+        f"{choice.worker.address}/v1/chat/completions",
+        body,
+    )
+    return StreamingResponse(
+        _streamWorkerResponse(client, stream_ctx, upstream),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/v1/messages", response_model=dict[str, Any])
+async def listMessages() -> dict[str, Any]:
     """Return all stored chat requests from etcd; only the active coordinator serves this."""
     _requireActive()
     assert membershipClient is not None
     raw = await membershipClient.getByPrefix("/relay/messages/")
-    result = {
-        key.removeprefix("/relay/messages/"): json.loads(value)
-        for key, value in raw.items()
-    }
+    result: dict[str, Any] = {}
+    for key, value in raw.items():
+        result[key.removeprefix("/relay/messages/")] = json.loads(value)
     logger.debug("Listed messages | count={}", len(result))
     return result
 
 
-@app.get("/v1/messages/{msgId}", response_model=dict)
-async def getMessage(msgId: str) -> dict:
+@app.get("/v1/messages/{msgId}", response_model=dict[str, Any])
+async def getMessage(msgId: str) -> dict[str, Any]:
     """Retrieve a single stored chat request by ID; only the active coordinator serves this."""
     _requireActive()
     assert membershipClient is not None
     value = await membershipClient.get(f"/relay/messages/{msgId}")
     if value is None:
         raise HTTPException(status_code=404, detail=f"Message {msgId} not found")
-    return json.loads(value)
+    obj = json.loads(value)
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=500, detail=f"Message {msgId} is not a JSON object")
+    return {str(key): item for key, item in obj.items()}
+
+
+async def _openWorkerStream(
+    url: str,
+    body: dict[str, object],
+) -> tuple[
+    httpx.AsyncClient,
+    AbstractAsyncContextManager[httpx.Response],
+    httpx.Response,
+]:
+    timeout = httpx.Timeout(timeout=None, connect=10.0)
+    client = httpx.AsyncClient(timeout=timeout)
+    stream_ctx = client.stream("POST", url, json=body)
+    try:
+        upstream = await stream_ctx.__aenter__()
+    except httpx.RequestError as e:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Worker unreachable: {e}") from e
+
+    if upstream.status_code >= 400:
+        error_body = (await upstream.aread()).decode("utf-8", errors="replace")
+        await stream_ctx.__aexit__(None, None, None)
+        await client.aclose()
+        raise HTTPException(
+            status_code=upstream.status_code,
+            detail=error_body[:500],
+        )
+    return client, stream_ctx, upstream
+
+
+async def _streamWorkerResponse(
+    client: httpx.AsyncClient,
+    stream_ctx: AbstractAsyncContextManager[httpx.Response],
+    upstream: httpx.Response,
+) -> AsyncIterator[bytes]:
+    try:
+        async for chunk in upstream.aiter_bytes():
+            yield chunk
+    finally:
+        await stream_ctx.__aexit__(
+            None,
+            None,
+            None,
+        )
+        await client.aclose()

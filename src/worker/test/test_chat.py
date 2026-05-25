@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from worker.inference.llamacpp import LlamaCppEngine
 
 
-async def chat_with_model():
+async def chat_with_model() -> bool:
     """Interactive chat with the model"""
     
     print("\n" + "="*70)
@@ -57,7 +57,7 @@ async def chat_with_model():
         
         # Check health
         health = await engine.health()
-        if not health.ok:
+        if not health.status:
             print(f"Server not healthy: {health.detail}")
             return False
         
@@ -128,8 +128,8 @@ async def chat_with_model():
                 })
             
             # Show telemetry
-            telemetry = await engine.get_telemetry()
-            print(f"\nTelemetry: Queue={telemetry.qw}, Memory={telemetry.mw:.1%}, Prefill={telemetry.sprefill_tokens_per_sec:.1f} tok/s")
+            telemetry = await engine.get_engine_telemetry()
+            print(f"\nEngine telemetry: Queue={telemetry.qw}, Memory={telemetry.mw:.1%}")
         
         return True
         

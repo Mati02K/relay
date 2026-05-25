@@ -43,9 +43,7 @@ class EtcdMembership(MembershipLayer):
     async def getAliveMembers(self) -> list[Node]:
         """Fetch all /relay/nodes/ keys from etcd and deserialize them."""
         resp = await self._stub.GetAliveMembers(relay_pb2.Empty())
-        members = [
-            Node(id=n.id, metadata=json.loads(n.metadata_json)) for n in resp.nodes
-        ]
+        members = [Node(id=n.id, metadata=json.loads(n.metadata_json)) for n in resp.nodes]
         logger.debug("Fetched alive members | count={}", len(members))
         return members
 
@@ -58,11 +56,7 @@ class EtcdMembership(MembershipLayer):
         """Consume the WatchMembership stream and invoke callback on each event."""
         try:
             async for event in self._stub.WatchMembership(relay_pb2.Empty()):
-                eventType = (
-                    "JOINED"
-                    if event.type == relay_pb2.MemberEvent.JOINED
-                    else "LEFT"
-                )
+                eventType = "JOINED" if event.type == relay_pb2.MemberEvent.JOINED else "LEFT"
                 node = Node(
                     id=event.node.id,
                     metadata=json.loads(event.node.metadata_json),
@@ -75,7 +69,9 @@ class EtcdMembership(MembershipLayer):
     async def holdLeadership(self) -> AsyncIterator[bool]:  # type: ignore[override]
         """Campaign for leadership; yield True when elected. Returns when stream ends."""
         async for status in self._stub.HoldLeadership(relay_pb2.Empty()):
-            logger.debug("Leadership status | isLeader={} leaderId={}", status.is_leader, status.leader_id)
+            logger.debug(
+                "Leadership status | isLeader={} leaderId={}", status.is_leader, status.leader_id
+            )
             yield status.is_leader
 
     async def put(self, key: str, value: str) -> None:

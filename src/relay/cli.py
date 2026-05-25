@@ -1,0 +1,202 @@
+"""Relay command-line interface."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from relay.config import ConfigError, load_config, save_config
+from relay.init import InitOptions, run_init
+from relay.models import catalog_rows, pull_catalog_model, register_local_model
+from relay.paths import RelayPaths
+from relay.software import doctor_checks
+from relay.supervisor import (
+    SupervisorError,
+    health_summary,
+    process_status_json,
+    read_log_tail,
+    start,
+    status,
+    stop,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the Relay CLI."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except (ConfigError, SupervisorError, RuntimeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="relay", description="Relay local cluster runtime")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = sub.add_parser("init", help="create local Relay config")
+    init_parser.add_argument("--role", choices=("coordinator", "worker", "all"))
+    init_parser.add_argument("--network", choices=("tailscale", "lan"))
+    init_parser.add_argument("--coordinator", help="coordinator URL/IP for worker nodes")
+    init_parser.add_argument("--node-id")
+    init_parser.add_argument("--host", help="bind/advertise host for this node")
+    init_parser.add_argument("--model", help="catalog model id to pull")
+    init_parser.add_argument("--model-path", help="local GGUF model path")
+    init_parser.add_argument("--skip-model", action="store_true")
+    init_parser.add_argument("--force", action="store_true")
+    init_parser.set_defaults(func=_cmd_init)
+
+    start_parser = sub.add_parser("start", help="start configured Relay processes")
+    start_parser.add_argument("--foreground", action="store_true")
+    start_parser.set_defaults(func=_cmd_start)
+
+    stop_parser = sub.add_parser("stop", help="stop Relay processes")
+    stop_parser.set_defaults(func=_cmd_stop)
+
+    status_parser = sub.add_parser("status", help="show process and HTTP health")
+    status_parser.add_argument("--json", action="store_true")
+    status_parser.set_defaults(func=_cmd_status)
+
+    logs_parser = sub.add_parser("logs", help="show process log tail")
+    logs_parser.add_argument("process", nargs="?", default="worker")
+    logs_parser.add_argument("--lines", type=int, default=80)
+    logs_parser.set_defaults(func=_cmd_logs)
+
+    doctor_parser = sub.add_parser("doctor", help="check local Relay runtime prerequisites")
+    doctor_parser.set_defaults(func=_cmd_doctor)
+
+    pull_parser = sub.add_parser("pull", help="download/register a model")
+    pull_parser.add_argument("model", nargs="?", help="catalog model id")
+    pull_parser.add_argument("--local", help="register a local GGUF model path")
+    pull_parser.add_argument("--id", help="model id for --local")
+    pull_parser.set_defaults(func=_cmd_pull)
+
+    models_parser = sub.add_parser("models", help="model commands")
+    models_sub = models_parser.add_subparsers(dest="models_command", required=True)
+    models_list = models_sub.add_parser("list", help="list configured and catalog models")
+    models_list.add_argument("--catalog", action="store_true")
+    models_list.set_defaults(func=_cmd_models_list)
+
+    return parser
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    config = run_init(
+        InitOptions(
+            role=args.role,
+            network=args.network,
+            coordinator=args.coordinator,
+            node_id=args.node_id,
+            host=args.host,
+            model=args.model,
+            model_path=args.model_path,
+            skip_model=bool(args.skip_model),
+            force=bool(args.force),
+        )
+    )
+    print(f"Config written to {RelayPaths.from_home().config}")
+    print(f"Role: {config.role}")
+    if config.runs_worker and not config.models:
+        print("No model configured yet. Run `relay pull <model>` or register a local GGUF.")
+    return 0
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    config = load_config()
+    statuses = start(config, foreground=bool(args.foreground))
+    for item in statuses:
+        pid = f" pid={item.pid}" if item.pid else ""
+        print(f"{item.name}: {item.detail}{pid}")
+    return 0
+
+
+def _cmd_stop(args: argparse.Namespace) -> int:
+    try:
+        config = load_config()
+    except ConfigError:
+        config = None
+    for item in stop(config):
+        pid = f" pid={item.pid}" if item.pid else ""
+        print(f"{item.name}: {item.detail}{pid}")
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    try:
+        config = load_config()
+    except ConfigError:
+        config = None
+    statuses = status(config)
+    if args.json:
+        print(process_status_json(statuses))
+    else:
+        for item in statuses:
+            pid = item.pid if item.pid is not None else "-"
+            state = "running" if item.running else "stopped"
+            print(f"{item.name:16} {state:8} pid={pid}")
+    if config is not None and any(item.running for item in statuses):
+        health = health_summary(config)
+        if health:
+            print(json.dumps(health, indent=2))
+    return 0
+
+
+def _cmd_logs(args: argparse.Namespace) -> int:
+    print(read_log_tail(str(args.process), lines=int(args.lines)))
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    try:
+        config = load_config()
+    except ConfigError:
+        config = None
+    checks = doctor_checks(config)
+    failed = False
+    for check in checks:
+        state = "ok" if check.ok else "missing"
+        print(f"{check.name:18} {state:8} {check.detail}")
+        failed = failed or not check.ok
+    return 1 if failed else 0
+
+
+def _cmd_pull(args: argparse.Namespace) -> int:
+    config = load_config()
+    if args.local:
+        model_id = args.id or Path(args.local).stem
+        config = register_local_model(config, model_id, Path(args.local))
+        save_config(config)
+        print(f"Registered local model {model_id}: {args.local}")
+        return 0
+    if not args.model:
+        print("Available models:")
+        for row in catalog_rows():
+            print("  " + row)
+        return 0
+    config, model = pull_catalog_model(config, str(args.model))
+    save_config(config)
+    print(f"Downloaded {model.id}: {model.path}")
+    return 0
+
+
+def _cmd_models_list(args: argparse.Namespace) -> int:
+    if args.catalog:
+        for row in catalog_rows():
+            print(row)
+        return 0
+    config = load_config()
+    if not config.models:
+        print("No local models configured.")
+        return 0
+    for model in config.models:
+        loaded = "loaded" if model.loaded else "available"
+        print(f"{model.id:16} {loaded:9} {model.engine:9} {model.path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

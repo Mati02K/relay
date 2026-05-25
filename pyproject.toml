@@ -13,10 +13,14 @@ dependencies = [
     "grpcio-tools>=1.64",
     "protobuf>=5.0",
     "httpx>=0.27",
+    "huggingface_hub>=0.23",
     "zeroconf>=0.132",
     "pydantic>=2.7",
     "loguru>=0.7",
 ]
+
+[project.scripts]
+relay = "relay.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -32,6 +36,14 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+membership = [
+    "etcd-go/go.mod",
+    "etcd-go/go.sum",
+    "etcd-go/main.go",
+    "etcd-go/membership/*.go",
+]
 
 [tool.ruff]
 line-length = 100
