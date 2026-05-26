@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Relay // Dashboard</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">◢</span>
+        <span class="brand-name">Relay</span>
+        <span class="env-tag">local · dashboard</span>
+      </div>
+      <div class="stats">
+        <div class="stat">
+          <span class="stat-label">workers</span>
+          <span class="stat-value" id="stat-workers">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">healthy</span>
+          <span class="stat-value" id="stat-healthy">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">avg q_w</span>
+          <span class="stat-value" id="stat-qw">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">avg m_w</span>
+          <span class="stat-value" id="stat-mw">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">throttled</span>
+          <span class="stat-value" id="stat-throttled">—</span>
+        </div>
+      </div>
+      <div class="connection">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span id="conn-status">connecting…</span>
+        <span class="coordinator-url" id="coordinator-url">—</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel workers">
+        <div class="panel-header">
+          <span class="panel-title">Workers</span>
+          <span class="panel-count" id="worker-count">0</span>
+        </div>
+        <div class="worker-list" id="worker-list">
+          <div class="empty">No workers registered.</div>
+        </div>
+      </aside>
+
+      <section class="chat">
+        <div class="chat-header">
+          <span class="chat-title">Chat</span>
+          <div class="chat-controls">
+            <label class="control-label" for="model-select">model</label>
+            <select id="model-select" class="model-select"></select>
+            <button id="clear-btn" class="ghost-btn" type="button">clear</button>
+          </div>
+        </div>
+        <div class="messages" id="messages">
+          <div class="empty messages-empty">
+            <div class="empty-title">Nothing here yet.</div>
+            <div class="empty-sub">Send a message to route a request through the coordinator.</div>
+          </div>
+        </div>
+        <div class="composer">
+          <textarea
+            id="prompt"
+            class="prompt"
+            rows="3"
+            placeholder="Type a message. ⌘/Ctrl+Enter to send."
+          ></textarea>
+          <div class="composer-row">
+            <span class="composer-hint" id="composer-hint">Idle</span>
+            <button id="cancel-btn" class="cancel-btn" type="button" disabled>cancel</button>
+            <button id="send-btn" class="send-btn" type="button">send</button>
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel detail">
+        <div class="panel-header">
+          <span class="panel-title">Last decision</span>
+          <span class="panel-count" id="detail-cost">—</span>
+        </div>
+        <div class="detail-body" id="detail-body">
+          <div class="empty">No request yet.</div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="bottombar">
+      <span class="footer-cell">relay dashboard</span>
+      <span class="footer-cell" id="dashboard-version">v0.1</span>
+      <span class="footer-cell" id="footer-coordinator">—</span>
+      <span class="footer-cell muted">⌘/Ctrl+Enter to send</span>
+    </footer>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

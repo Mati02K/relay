@@ -35,7 +35,7 @@ def test_interactive_pull_accepts_numbered_model(
 
     run_init(
         InitOptions(
-            role="all",
+            role="dual",
             network="lan",
             coordinator=None,
             node_id="numbered-model-node",
@@ -43,7 +43,6 @@ def test_interactive_pull_accepts_numbered_model(
             model=None,
             model_path=None,
             skip_model=False,
-            force=True,
         )
     )
 

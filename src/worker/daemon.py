@@ -16,12 +16,16 @@ from membership.base import MembershipLayer
 from membership.etcd import EtcdMembership
 from network.tailscale import TailscaleNetwork
 from telemetry.request_metrics import extract_usage_token_counts
+from telemetry.schemas import SystemTelemetry
 from telemetry.state import WorkerTelemetryState
+from telemetry.thermal import ThermalAggregator, detect_thermal_collectors
 from worker.inference.base import InferenceEngine
 from worker.inference.llamacpp import LlamaCppEngine
 
 WORKER_METADATA_KEY_PREFIX = "/relay/workers"
 TELEMETRY_INTERVAL_SECONDS = 0.2
+THERMAL_INTERVAL_SECONDS = float(os.getenv("RELAY_THERMAL_INTERVAL_SECONDS", "5.0"))
+WORKER_LEASE_TTL_SECONDS = int(os.getenv("RELAY_WORKER_LEASE_TTL_SECONDS", "10"))
 
 
 class WorkerDaemon:
@@ -40,14 +44,20 @@ class WorkerDaemon:
         membership: MembershipLayer,
         inference_engine: InferenceEngine,
         telemetry: WorkerTelemetryState | None = None,
+        thermal: ThermalAggregator | None = None,
         telemetry_interval_seconds: float = TELEMETRY_INTERVAL_SECONDS,
+        thermal_interval_seconds: float = THERMAL_INTERVAL_SECONDS,
     ) -> None:
         self.node_id = node_id
         self.address = address
         self.membership = membership
         self.inference_engine = inference_engine
         self.telemetry = telemetry or WorkerTelemetryState()
+        self.thermal = thermal or ThermalAggregator(
+            detect_thermal_collectors(uses_gpu=inference_engine.uses_gpu)
+        )
         self.telemetry_interval_seconds = telemetry_interval_seconds
+        self.thermal_interval_seconds = max(0.5, thermal_interval_seconds)
         self._tasks: list[asyncio.Task[None]] = []
 
     @classmethod
@@ -76,7 +86,12 @@ class WorkerDaemon:
         )
 
     async def start(self) -> None:
-        """Register the worker and start telemetry publication."""
+        """Register the worker under a lease and start background publishers.
+
+        Metadata and telemetry are attached to an etcd lease so the keys vanish
+        automatically if this process crashes or loses the network. See
+        :meth:`MembershipLayer.holdLease` for the contract.
+        """
         telemetry = await self.telemetry.snapshot()
         metadata = {
             "role": "worker",
@@ -87,10 +102,17 @@ class WorkerDaemon:
             "models": _worker_models(),
             "prefix_cache": telemetry.prefix_cache.model_dump(),
         }
+        await self.membership.holdLease(WORKER_LEASE_TTL_SECONDS)
         await self.membership.register(self.node_id, metadata)
-        await self.membership.put(self._metadata_key(), json.dumps(metadata))
+        await self.membership.putWithLease(self._metadata_key(), json.dumps(metadata))
         self._tasks.append(asyncio.create_task(self._publish_telemetry_loop()))
-        logger.info("Worker daemon started | nodeId={} addr={}", self.node_id, self.address)
+        self._tasks.append(asyncio.create_task(self._collect_thermal_loop()))
+        logger.info(
+            "Worker daemon started | nodeId={} addr={} thermalCollectors={}",
+            self.node_id,
+            self.address,
+            self.thermal.collector_names,
+        )
 
     async def stop(self) -> None:
         """Stop background tasks and deregister the worker."""
@@ -98,6 +120,7 @@ class WorkerDaemon:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self.thermal.close()
         await self.inference_engine.stop()
         await self.membership.deregister(self.node_id)
         await self.membership.close()
@@ -162,12 +185,26 @@ class WorkerDaemon:
             try:
                 await self._refresh_engine_telemetry()
                 snapshot = await self.telemetry.snapshot()
-                await self.membership.put(self._telemetry_key(), snapshot.model_dump_json())
+                await self.membership.putWithLease(
+                    self._telemetry_key(),
+                    snapshot.model_dump_json(),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Telemetry publication failed | nodeId={}", self.node_id)
             await asyncio.sleep(self.telemetry_interval_seconds)
+
+    async def _collect_thermal_loop(self) -> None:
+        while True:
+            try:
+                theta_w = await self.thermal.sample()
+                await self.telemetry.update_system(SystemTelemetry(jw=0.0, theta_w=theta_w))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Thermal collection failed | nodeId={}", self.node_id)
+            await asyncio.sleep(self.thermal_interval_seconds)
 
     async def _refresh_engine_telemetry(self) -> None:
         engine_telemetry = await self.inference_engine.get_engine_telemetry()

@@ -1,56 +1,89 @@
-# Integration Tests
+# Tests
 
-Docker-based test environment that simulates a two-node Relay cluster on a single machine. Runs the full stack: 3-node etcd cluster, Go gRPC middleware, two coordinators, two workers, and a test runner that verifies end-to-end message storage and retrieval.
+This repository currently uses the source-tree tests and CLI verification flow
+as the primary test path.
 
-## Prerequisites
+## Unit Tests
 
-- Docker with Compose
-- A Tailscale ephemeral auth key ([generate one here](https://login.tailscale.com/admin/settings/keys) — check "Ephemeral")
-
-## Setup
+Run the focused Python tests:
 
 ```bash
-cp .env.example .env
-# Edit .env and set TAILSCALE_AUTHKEY=tskey-auth-...
+.venv/bin/pytest src/relay/test/test_init.py
+.venv/bin/pytest src/coordinator/test/test_scheduler.py
 ```
 
-Ephemeral keys auto-remove nodes from your tailnet when containers exit, so test runs don't accumulate phantom devices.
-
-## Run
+Run both together:
 
 ```bash
-# From the repo root
-docker compose -f test/docker-compose.yml up --build -d
-docker compose -f test/docker-compose.yml -f test/docker-compose.test.yml run --rm test-runner
-docker compose -f test/docker-compose.yml down
+.venv/bin/pytest src/relay/test/test_init.py src/coordinator/test/test_scheduler.py
 ```
 
-## What the tests check
-
-1. Worker becomes healthy and discovers an elected coordinator
-2. POST `/v1/chat` via worker-1 stores a message (forwarded to active coordinator → etcd)
-3. GET `/v1/messages` via worker-2 retrieves the same message (different worker, same coordinator)
-
-## Testing failover manually
+## Static Checks
 
 ```bash
-# While the stack is running, stop the active coordinator
-docker compose -f test/docker-compose.yml stop coordinator-2
-
-# Wait ~10 seconds, then check the worker — it should show coordinator-1 as the new leader
-curl http://localhost:9091/health
-
-# Re-run the tests — should still pass against the new coordinator
-docker compose -f test/docker-compose.yml -f test/docker-compose.test.yml run --rm test-runner
+.venv/bin/ruff check src/relay src/coordinator src/telemetry src/worker/daemon.py src/worker/main.py src/worker/inference src/membership/etcd.py
+.venv/bin/ruff format --check src/relay src/coordinator src/telemetry src/worker/daemon.py src/worker/main.py src/worker/inference src/membership/etcd.py
+.venv/bin/mypy src/relay src/coordinator src/telemetry src/worker/daemon.py src/worker/main.py src/worker/inference
 ```
 
-## Container map
+## Go Middleware Check
 
-| Container | Role |
-|-----------|------|
-| `test-etcd-{1,2,3}-1` | 3-node etcd Raft cluster |
-| `test-membership-etcd-1` | Go gRPC middleware (wraps etcd) |
-| `test-coordinator-{1,2}-1` | Coordinator on simulated Node 1 and Node 2 |
-| `test-worker-{1,2}-1` | Worker on simulated Node 1 and Node 2 |
+```bash
+cd src/membership/etcd-go
+go test ./...
+```
 
-In bare metal each node runs all four components locally. See the root [README.md](../README.md) for bare metal setup.
+If system Go is unavailable, run `relay init` first; Relay can install a managed
+Go toolchain under `~/.relay/bin/`.
+
+## Local Runtime Verification
+
+Use an isolated Relay home so the test does not touch the user's normal
+`~/.relay` state:
+
+```bash
+export RELAY_HOME=/tmp/relay-test
+relay init --role dual --network lan --node-id test-node --model qwen2.5-0.5b
+relay start
+relay status
+```
+
+Expected process shape:
+
+```text
+etcd             running
+membership-etcd  running
+coordinator      running
+worker           running
+```
+
+Send one OpenAI-compatible request through the coordinator:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen2.5-0.5b",
+    "messages": [{"role": "user", "content": "Say hello"}],
+    "max_tokens": 8
+  }'
+```
+
+The runtime test passes when the stream ends with:
+
+```text
+data: [DONE]
+```
+
+Clean up:
+
+```bash
+relay stop
+unset RELAY_HOME
+```
+
+## Legacy Docker Notes
+
+Older experiments used Docker Compose to simulate a multi-node etcd/Tailscale
+cluster. That path is not the current primary verification flow. Prefer the CLI
+runtime test above unless a task explicitly asks for Docker-based cluster work.

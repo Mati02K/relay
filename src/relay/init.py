@@ -25,6 +25,8 @@ from relay.config import (
 from relay.models import MODEL_CATALOG, pull_catalog_model, register_local_model
 from relay.paths import RelayPaths
 from relay.software import ensure_runtime_software
+from relay.supervisor import stop as stop_managed_processes
+from relay.ui import muted, warn
 
 
 @dataclass(frozen=True)
@@ -39,15 +41,20 @@ class InitOptions:
     model: str | None
     model_path: str | None
     skip_model: bool
-    force: bool
 
 
 def run_init(options: InitOptions) -> RelayConfig:
-    """Create and persist a Relay config."""
+    """Create and persist a Relay config, overwriting any existing config.
+
+    Always stops Relay processes started by a previous ``relay start`` and
+    wipes the etcd data directory. This keeps re-running ``relay init`` safe:
+    no zombie processes against a stale config, and the freshly-generated
+    ``cluster_id`` matches the (now empty) etcd state directory so the next
+    ``relay start`` actually boots.
+    """
     paths = RelayPaths.from_home()
     paths.ensure()
-    if paths.config.exists() and not options.force:
-        raise ConfigError(f"Config already exists at {paths.config}. Use --force to replace it.")
+    _reset_runtime_state(paths)
 
     role = _select_role(options.role)
     network = _select_network(options.network)
@@ -83,18 +90,30 @@ def run_init(options: InitOptions) -> RelayConfig:
     return config
 
 
+def _reset_runtime_state(paths: RelayPaths) -> None:
+    """Stop any running Relay processes and clear the etcd data dir."""
+    statuses = stop_managed_processes(config=None)
+    stopped_names = [s.name for s in statuses if s.detail == "stopped"]
+    if stopped_names:
+        print(warn("stopped:"), ", ".join(stopped_names))
+    if paths.etcd_data.exists():
+        shutil.rmtree(paths.etcd_data)
+        print(muted("cleared:"), str(paths.etcd_data))
+
+
 def _select_role(value: str | None) -> NodeRole:
     if value:
         return cast(
             NodeRole,
-            _validate_choice(value, ("coordinator", "worker", "all"), "role"),
+            _validate_choice(value, ("coordinator", "worker", "dual"), "role"),
         )
     return cast(
         NodeRole,
         _prompt_choice(
             "Node role",
-            ("coordinator", "worker", "all"),
-            default="all",
+            ("coordinator", "worker", "dual"),
+            default="dual",
+            suffix={"dual": "coordinator + worker on this machine"},
         ),
     )
 
@@ -143,8 +162,7 @@ def _configure_model(config: RelayConfig, options: InitOptions) -> RelayConfig:
 
     print("Available models:")
     for index, model in enumerate(MODEL_CATALOG, start=1):
-        note = f" - {model.notes}" if model.notes else ""
-        print(f"  {index}. {model.id} ({model.label}){note}")
+        print(f"  {index}. {model.id} ({model.label})")
     selected = _prompt_text("Model id or number", default=MODEL_CATALOG[1].id, required=False)
     selected = _resolve_catalog_model_selection(selected)
     updated, _ = pull_catalog_model(config, selected)

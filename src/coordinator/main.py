@@ -3,7 +3,9 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator, AsyncIterator
 
 import httpx
@@ -13,16 +15,19 @@ from loguru import logger
 from pydantic import BaseModel
 
 import logger as loggerSetup
-from coordinator.scheduler import SchedulingError, choose_worker
-from coordinator.worker_registry import fetch_worker_snapshots
+from coordinator.scheduler import SchedulingError, WorkerChoice, choose_worker
+from coordinator.worker_registry import WorkerSnapshot, fetch_worker_snapshots
 from membership.etcd import EtcdMembership
 from network.tailscale import TailscaleNetwork
+from telemetry.jitter import JitterProbe
 
 NODE_ID: str = os.getenv("NODE_ID", "coordinator")
 COORDINATOR_PORT: int = int(os.getenv("COORDINATOR_PORT", "8080"))
 ACTIVE_COORDINATOR_KEY: str = "/relay/active-coordinator"
+SCHEDULE_MAX_ATTEMPTS: int = max(1, int(os.getenv("RELAY_SCHEDULE_MAX_ATTEMPTS", "3")))
 
 membershipClient: EtcdMembership | None = None
+jitterProbe: JitterProbe | None = None
 _isActive: bool = False
 
 
@@ -77,8 +82,8 @@ async def _leadershipLoop(membership: EtcdMembership, myAddr: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Set up logging, membership, and leadership campaign on startup."""
-    global membershipClient
+    """Set up logging, membership, jitter probe, and leadership campaign on startup."""
+    global membershipClient, jitterProbe
 
     loggerSetup.setup()
     log = logger.bind(nodeId=NODE_ID)
@@ -95,12 +100,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await membershipClient.register(NODE_ID, {"role": "coordinator", "ip": myAddress})
     log.info("Registered in membership layer | nodeId={}", NODE_ID)
 
+    jitterProbe = JitterProbe(membershipClient)
+    await jitterProbe.start()
+
     # Start leader election in background — does not block startup.
     asyncio.create_task(_leadershipLoop(membershipClient, myAddr))
 
     yield
 
     log.info("Coordinator shutting down | nodeId={}", NODE_ID)
+    if jitterProbe is not None:
+        await jitterProbe.stop()
     await membershipClient.put(ACTIVE_COORDINATOR_KEY, "")
     await membershipClient.deregister(NODE_ID)
     await membershipClient.close()
@@ -165,27 +175,112 @@ async def chatCompletions(request: Request) -> StreamingResponse:
         body[key] = value
 
     workers = await fetch_worker_snapshots(membershipClient)
+    if jitterProbe is not None:
+        for worker in workers:
+            measured = jitterProbe.get_jitter_ms(worker.node_id)
+            if measured is not None:
+                worker.telemetry.jw = measured
+
     try:
-        choice = choose_worker(body, workers)
+        choice, opened, attempts = await _open_stream_with_retry(
+            body,
+            workers,
+            lambda worker: _openWorkerStream(worker, body),
+            SCHEDULE_MAX_ATTEMPTS,
+        )
     except SchedulingError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
+    except WorkerUnreachable as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"All eligible workers unreachable; last error: {e}",
+        ) from e
 
     logger.info(
-        "Scheduled chat completion | worker={} matchedTokens={} uncachedTokens={} cost={:.3f}",
+        "Scheduled chat completion | worker={} matchedTokens={} uncachedTokens={} "
+        "cost={:.3f} attempts={}",
         choice.worker.node_id,
         choice.matched_tokens,
         choice.uncached_prompt_tokens,
         choice.cost,
+        attempts,
     )
 
-    client, stream_ctx, upstream = await _openWorkerStream(
-        f"{choice.worker.address}/v1/chat/completions",
-        body,
-    )
     return StreamingResponse(
-        _streamWorkerResponse(client, stream_ctx, upstream),
+        _streamWorkerResponse(opened.client, opened.stream_ctx, opened.upstream),
         media_type="text/event-stream",
+        headers={
+            "X-Relay-Worker": choice.worker.node_id,
+            "X-Relay-Cost": f"{choice.cost:.4f}",
+            "X-Relay-Matched-Tokens": str(choice.matched_tokens),
+            "X-Relay-Prompt-Tokens": str(choice.prompt_tokens),
+            "X-Relay-Overlap": f"{choice.overlap:.4f}",
+            "X-Relay-Attempts": str(attempts),
+            "Access-Control-Expose-Headers": (
+                "X-Relay-Worker, X-Relay-Cost, X-Relay-Matched-Tokens, "
+                "X-Relay-Prompt-Tokens, X-Relay-Overlap, X-Relay-Attempts"
+            ),
+        },
     )
+
+
+@app.get("/v1/models")
+async def listModels() -> dict[str, Any]:
+    """OpenAI-compatible model list: union of loaded models across all workers.
+
+    Used by OpenAI-style clients (Open WebUI etc.) to populate the model
+    selector when they connect. Duplicates across workers are folded into a
+    single entry — the scheduler decides at request time which worker actually
+    serves it.
+    """
+    _requireActive()
+    assert membershipClient is not None
+    workers = await fetch_worker_snapshots(membershipClient)
+    return {"object": "list", "data": _collect_model_entries(workers)}
+
+
+def _collect_model_entries(workers: Sequence[WorkerSnapshot]) -> list[dict[str, Any]]:
+    """Return a deduplicated OpenAI-shaped list of models advertised by workers."""
+    seen: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    for worker in workers:
+        models = worker.metadata.get("models")
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            model_id = model.get("id")
+            if not isinstance(model_id, str) or not model_id or model_id in seen:
+                continue
+            if not model.get("loaded", True):
+                continue
+            seen.add(model_id)
+            entries.append({"id": model_id, "object": "model", "owned_by": "relay"})
+    return entries
+
+
+@app.get("/v1/workers")
+async def listWorkers() -> list[dict[str, Any]]:
+    """Return registered workers with their latest telemetry for dashboards/tools."""
+    _requireActive()
+    assert membershipClient is not None
+    workers = await fetch_worker_snapshots(membershipClient)
+    if jitterProbe is not None:
+        for worker in workers:
+            measured = jitterProbe.get_jitter_ms(worker.node_id)
+            if measured is not None:
+                worker.telemetry.jw = measured
+    return [
+        {
+            "node_id": worker.node_id,
+            "address": worker.address,
+            "models": worker.metadata.get("models", []),
+            "engines": worker.metadata.get("engines", []),
+            "telemetry": worker.telemetry.model_dump(),
+        }
+        for worker in workers
+    ]
 
 
 @app.get("/v1/messages", response_model=dict[str, Any])
@@ -215,14 +310,33 @@ async def getMessage(msgId: str) -> dict[str, Any]:
     return {str(key): item for key, item in obj.items()}
 
 
-async def _openWorkerStream(
-    url: str,
-    body: dict[str, object],
-) -> tuple[
-    httpx.AsyncClient,
-    AbstractAsyncContextManager[httpx.Response],
-    httpx.Response,
-]:
+class WorkerUnreachable(Exception):
+    """Raised when a worker cannot be reached at the network level.
+
+    Distinct from an HTTP error response: this means the worker either refused
+    the TCP connection, timed out, was unresolvable, etc. Callers should treat
+    this as "try a different worker" — not a client-visible error in itself.
+    """
+
+    def __init__(self, node_id: str, address: str, cause: Exception) -> None:
+        super().__init__(f"{node_id} ({address}): {cause}")
+        self.node_id = node_id
+        self.address = address
+        self.cause = cause
+
+
+@dataclass(frozen=True)
+class OpenedStream:
+    """Successfully-opened upstream stream ready to forward to the client."""
+
+    client: httpx.AsyncClient
+    stream_ctx: AbstractAsyncContextManager[httpx.Response]
+    upstream: httpx.Response
+
+
+async def _openWorkerStream(worker: WorkerSnapshot, body: dict[str, object]) -> OpenedStream:
+    """Open an SSE stream to ``worker``; raise WorkerUnreachable on connect failure."""
+    url = f"{worker.address}/v1/chat/completions"
     timeout = httpx.Timeout(timeout=None, connect=10.0)
     client = httpx.AsyncClient(timeout=timeout)
     stream_ctx = client.stream("POST", url, json=body)
@@ -230,9 +344,11 @@ async def _openWorkerStream(
         upstream = await stream_ctx.__aenter__()
     except httpx.RequestError as e:
         await client.aclose()
-        raise HTTPException(status_code=502, detail=f"Worker unreachable: {e}") from e
+        raise WorkerUnreachable(worker.node_id, worker.address, e) from e
 
     if upstream.status_code >= 400:
+        # The worker responded — this is its considered answer, not a transport
+        # failure. Pass it through as-is; do NOT retry on another worker.
         error_body = (await upstream.aread()).decode("utf-8", errors="replace")
         await stream_ctx.__aexit__(None, None, None)
         await client.aclose()
@@ -240,7 +356,55 @@ async def _openWorkerStream(
             status_code=upstream.status_code,
             detail=error_body[:500],
         )
-    return client, stream_ctx, upstream
+    return OpenedStream(client=client, stream_ctx=stream_ctx, upstream=upstream)
+
+
+async def _open_stream_with_retry(
+    body: dict[str, object],
+    workers: Sequence[WorkerSnapshot],
+    open_fn: Callable[[WorkerSnapshot], Awaitable[OpenedStream]],
+    max_attempts: int,
+) -> tuple[WorkerChoice, OpenedStream, int]:
+    """Schedule a worker and open its stream; retry on connect-level failure.
+
+    Failed workers are excluded from subsequent ``choose_worker`` calls so the
+    scheduler picks the next-best from the survivors. Stops when a stream opens,
+    when no eligible workers remain, or when ``max_attempts`` is reached.
+
+    Returns ``(choice, opened, attempt_count)`` where ``attempt_count`` is 1 for
+    success on the first try. Raises :class:`WorkerUnreachable` if every tried
+    worker failed, or :class:`SchedulingError` if no candidate was eligible to
+    begin with.
+    """
+    tried: set[str] = set()
+    last_error: WorkerUnreachable | None = None
+    for attempt in range(1, max_attempts + 1):
+        candidates = [worker for worker in workers if worker.node_id not in tried]
+        try:
+            choice = choose_worker(body, candidates)
+        except SchedulingError:
+            if last_error is not None:
+                raise last_error
+            raise
+        try:
+            opened = await open_fn(choice.worker)
+        except WorkerUnreachable as e:
+            # Trust the worker we just picked, not the exception payload — the
+            # set must reflect what we actually tried, not whatever the opener
+            # decided to put in the exception.
+            tried.add(choice.worker.node_id)
+            last_error = e
+            logger.warning(
+                "Worker unreachable, retrying | worker={} attempt={} cause={}",
+                choice.worker.node_id,
+                attempt,
+                e.cause,
+            )
+            continue
+        return choice, opened, attempt
+
+    assert last_error is not None
+    raise last_error
 
 
 async def _streamWorkerResponse(

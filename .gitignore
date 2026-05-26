@@ -11,6 +11,9 @@ venv/
 src/*.egg-info/
 dist/
 build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Generated gRPC stubs — regenerate with `make proto`
 src/membership/relay_pb2.py

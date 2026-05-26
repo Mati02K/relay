@@ -75,6 +75,11 @@ class LlamaCppEngine(InferenceEngine):
     def base_url(self) -> str:
         return f"http://{self._host}:{self._port}"
 
+    @property
+    def uses_gpu(self) -> bool:
+        """``n_gpu_layers != 0`` means at least one transformer layer runs on GPU."""
+        return self._n_gpu_layers != 0
+
     async def start(self) -> None:
         """Spawn ``llama-server`` if not already running (idempotent)."""
         async with self._lock:

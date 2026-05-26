@@ -122,6 +122,49 @@ func (s *server) HoldLeadership(_ *pb.Empty, stream pb.MembershipService_HoldLea
 	return nil
 }
 
+// HoldLease creates an etcd session with the requested TTL and keeps the
+// underlying lease alive for as long as the stream is open. The first message
+// carries the lease id so the client can attach PutWithLease writes to it.
+// When the stream closes — graceful client shutdown or transport failure —
+// the session is revoked and etcd auto-deletes every key bound to the lease.
+//
+// This is the worker-liveness primitive: a crashed worker stops the stream,
+// and within ~TTL seconds its registration and telemetry keys disappear.
+func (s *server) HoldLease(req *pb.LeaseRequest, stream pb.MembershipService_HoldLeaseServer) error {
+	ctx := stream.Context()
+
+	ttl := req.TtlSeconds
+	if ttl < 5 {
+		ttl = 5
+	}
+	if ttl > 60 {
+		ttl = 60
+	}
+
+	session, err := concurrency.NewSession(s.etcdClient, concurrency.WithTTL(int(ttl)))
+	if err != nil {
+		return err
+	}
+
+	leaseID := int64(session.Lease())
+	if err := stream.Send(&pb.LeaseStatus{LeaseId: leaseID, Alive: true}); err != nil {
+		session.Close()
+		return err
+	}
+
+	// Hold the stream open until the client disconnects.
+	<-ctx.Done()
+	session.Close()
+	return nil
+}
+
+// PutWithLease writes a key bound to the given lease id. The key expires
+// automatically when the lease expires or is revoked.
+func (s *server) PutWithLease(ctx context.Context, req *pb.LeaseKVPair) (*pb.Empty, error) {
+	_, err := s.etcdClient.Put(ctx, req.Key, req.Value, clientv3.WithLease(clientv3.LeaseID(req.LeaseId)))
+	return &pb.Empty{}, err
+}
+
 // GetByPrefix returns all key-value pairs whose keys start with the given prefix.
 func (s *server) GetByPrefix(ctx context.Context, req *pb.KeyRequest) (*pb.KVList, error) {
 	resp, err := s.etcdClient.Get(ctx, req.Key, clientv3.WithPrefix())

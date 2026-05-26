@@ -22,7 +22,6 @@ class CatalogModel:
     file_patterns: tuple[str, ...]
     quant: str = "Q4_K_M"
     context_length: int | None = None
-    notes: str = ""
 
 
 MODEL_CATALOG: tuple[CatalogModel, ...] = (
@@ -31,7 +30,6 @@ MODEL_CATALOG: tuple[CatalogModel, ...] = (
         label="Qwen2.5 0.5B Instruct",
         repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
         file_patterns=("*q4_k_m*.gguf", "*q4_0*.gguf", "*.gguf"),
-        notes="Smallest quick smoke-test model.",
     ),
     CatalogModel(
         id="qwen2.5-1.5b",
@@ -69,6 +67,23 @@ MODEL_CATALOG: tuple[CatalogModel, ...] = (
         repo_id="bartowski/Mistral-7B-Instruct-v0.3-GGUF",
         file_patterns=("*q4_k_m*.gguf", "*q4_0*.gguf", "*.gguf"),
     ),
+    CatalogModel(
+        id="qwen2.5-coder-7b",
+        label="Qwen2.5 Coder 7B Instruct",
+        # bartowski's repo ships a single-file Q4_K_M; the official
+        # Qwen/Qwen2.5-Coder-7B-Instruct-GGUF splits it across 4 parts which
+        # our downloader cannot reassemble.
+        repo_id="bartowski/Qwen2.5-Coder-7B-Instruct-GGUF",
+        file_patterns=("*q4_k_m*.gguf", "*q4_0*.gguf", "*.gguf"),
+    ),
+    CatalogModel(
+        id="qwen-moe-a2.7b",
+        label="Qwen1.5 MoE A2.7B Chat (14B total, 2.7B active)",
+        # Note the unusual repo naming: RichardErkhov mirrors HF repos by
+        # replacing the slash with "_-_" and lowercasing "gguf".
+        repo_id="RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf",
+        file_patterns=("*q4_k_m*.gguf", "*q4_0*.gguf", "*.gguf"),
+    ),
 )
 
 
@@ -88,11 +103,7 @@ def find_catalog_model(model_id: str) -> CatalogModel:
 
 def catalog_rows() -> list[str]:
     """Return display rows for the model catalog."""
-    rows: list[str] = []
-    for model in MODEL_CATALOG:
-        note = f" - {model.notes}" if model.notes else ""
-        rows.append(f"{model.id:16} {model.label} ({model.repo_id}){note}")
-    return rows
+    return [f"{model.id:18} {model.label} ({model.repo_id})" for model in MODEL_CATALOG]
 
 
 def register_local_model(config: RelayConfig, model_id: str, path: Path) -> RelayConfig:

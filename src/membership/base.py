@@ -48,5 +48,17 @@ class MembershipLayer(ABC):
         """Return all key-value pairs whose keys start with the given prefix."""
 
     @abstractmethod
+    async def holdLease(self, ttlSeconds: int) -> int:
+        """Grant a session-backed lease and keep it alive in the background.
+
+        Returns the lease id. All ``putWithLease`` calls in this client are tied
+        to this lease until ``close`` is called or the underlying stream dies.
+        """
+
+    @abstractmethod
+    async def putWithLease(self, key: str, value: str) -> None:
+        """Write a key bound to the currently-held lease; auto-deletes on expiry."""
+
+    @abstractmethod
     async def close(self) -> None:
         """Close the underlying connection."""

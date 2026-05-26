@@ -14,6 +14,15 @@ service MembershipService {
   rpc GetByPrefix(KeyRequest) returns (KVList);
   // Hold open while this node is the elected leader; server resigns when stream closes.
   rpc HoldLeadership(Empty) returns (stream LeaderStatus);
+  // Hold a lease alive while this stream is open. Server creates an etcd session
+  // with the requested TTL, yields the lease id once, and keeps it alive until
+  // the stream closes (graceful client close or transport failure). When the
+  // stream ends the session is revoked and every key attached to the lease is
+  // auto-deleted by etcd within the TTL window.
+  rpc HoldLease(LeaseRequest) returns (stream LeaseStatus);
+  // Write a key bound to the given lease id; the key is deleted automatically
+  // when the lease expires or is revoked.
+  rpc PutWithLease(LeaseKVPair) returns (Empty);
 }
 
 
@@ -69,6 +78,24 @@ message KVList {
 message LeaderStatus {
   bool is_leader = 1;
   string leader_id = 2;
+}
+
+message LeaseRequest {
+  // Requested TTL in seconds. Server clamps to a sensible range (e.g. >= 5).
+  int64 ttl_seconds = 1;
+}
+
+message LeaseStatus {
+  int64 lease_id = 1;
+  // Stays true for the lifetime of the stream. Provided so the client knows
+  // the lease was successfully granted before the first PutWithLease.
+  bool alive = 2;
+}
+
+message LeaseKVPair {
+  string key = 1;
+  string value = 2;
+  int64 lease_id = 3;
 }
 
 message Empty {}

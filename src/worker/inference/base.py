@@ -38,3 +38,8 @@ class InferenceEngine(ABC):
     @abstractmethod
     async def get_engine_telemetry(self) -> EngineReportedTelemetry:
         """Latest telemetry that can be reported directly by the inference backend."""
+
+    @property
+    def uses_gpu(self) -> bool:
+        """Whether the active model is currently offloaded (partially or fully) to a GPU."""
+        return True

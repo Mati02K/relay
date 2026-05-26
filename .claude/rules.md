@@ -55,3 +55,15 @@ For multi-step tasks, state a brief plan:
 2. [Step] → verify: [check]
 3. [Step] → verify: [check]
 ```
+
+## 5. Relay-Specific Constraints
+
+**Keep the runtime and scheduler aligned with the current design.**
+
+- etcd plus `membership-etcd` is the default membership path.
+- Do not restore `membership-local` or another placeholder membership service as the default.
+- `relay init` and `relay start` must keep working as the primary user workflow.
+- The coordinator scheduling score must stay aligned with `Scheduling_in_D_Edge_Serving.pdf`.
+- If you change scheduler math, explicitly preserve or justify changes to `q_w`, `s_w(b)`, `overlap(w,r)`, `m_w`, `j_w/j_max`, and `theta_w`.
+- Jitter and thermal fields currently have schemas only; do not claim real collector support unless you implement and test it.
+- Prefer clean `RELAY_HOME=/tmp/...` runs for runtime testing so local user state is not damaged.

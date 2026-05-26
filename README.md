@@ -124,7 +124,7 @@ uv run relay --help
 Initialize one machine as both coordinator and worker:
 
 ```bash
-relay init --role all
+relay init --role dual
 ```
 
 Recommended choices for the first local test:
@@ -151,7 +151,7 @@ Start Relay:
 relay start
 ```
 
-Expected process shape for `--role all`:
+Expected process shape for `--role dual`:
 
 ```text
 etcd: log=... pid=...
@@ -216,7 +216,7 @@ existing `~/.relay` config or running cluster state:
 ```bash
 export RELAY_HOME=/tmp/relay-test
 relay stop
-relay init --role all --network lan --node-id test-node --model qwen2.5-0.5b --force
+relay init --role dual --network lan --node-id test-node --model qwen2.5-0.5b
 relay start
 ```
 
@@ -303,7 +303,7 @@ relay init
 Common role choices:
 
 ```bash
-relay init --role all
+relay init --role dual
 relay init --role coordinator
 relay init --role worker --coordinator http://COORDINATOR_IP:8080
 ```
@@ -566,81 +566,257 @@ Pull the smallest smoke-test model:
 relay pull qwen2.5-0.5b
 ```
 
-## Multi-Machine Use
+## Multi-Machine Setup (Tailscale)
 
-Current multi-machine flow uses a coordinator address directly. There is no
-invite code yet.
+This walks through bringing up a cluster of 2+ machines over a Tailscale
+tailnet: one coordinator node and one or more worker nodes. Chat requests
+go to the coordinator's URL; the coordinator picks a worker based on its
+cost function and streams the response back to the caller.
 
-Machine A:
+### What you'll have at the end
 
-```bash
-relay init --role all
-relay start
+```
+                Tailscale tailnet (100.x.y.z addresses)
+
+  Machine A (coordinator)          Machine B (worker)    Machine C (worker)
+  ┌────────────────────┐           ┌─────────────┐       ┌─────────────┐
+  │ etcd               │           │ worker      │       │ worker      │
+  │ membership-etcd    │◄──────────┤ + llama-srv │       │ + llama-srv │
+  │ coordinator :8080  │  register │             │       │             │
+  │ worker (optional)  │           └─────────────┘       └─────────────┘
+  └────────────────────┘                 ▲                       ▲
+            ▲                            │                       │
+            │  dashboard / curl /         │  direct chat stream  │
+            │  Open WebUI                 └───────────────────────┘
+            │                                 (chosen by scheduler)
+       you ─┘
 ```
 
-Machine B:
+> Coordinator is currently a single point of failure — if Machine A dies,
+> the cluster is down. Worker deaths are handled transparently via lease
+> expiry + pre-stream retry. See "Current Status" for the full HA story.
 
-```bash
-relay init --role worker --coordinator http://COORDINATOR_IP:8080
-relay start
-```
+### 0. Prerequisites
 
-Use a normal LAN IP if both machines can reach each other directly. Use a
-Tailscale IP if the machines are on different networks or behind NAT.
+On **every** machine:
 
-LAN discovery is not implemented yet. Selecting `lan` records the backend in
-config, but automatic peer discovery is future work.
+- Python 3.11+, `uv` (or pip), and Relay installed from source — see the
+  install sections at the top of this README.
+- Tailscale installed and authenticated. You should be able to run
+  `tailscale ip -4` and see a `100.x.y.z` address.
 
-## Tailscale Setup
+#### Install Tailscale
 
-Tailscale is only needed when coordinator and worker machines must reach each
-other across different networks, NATs, or Wi-Fi environments where normal local
-IP addresses are not reliable.
-
-You do not need Tailscale for:
-
-- a single-machine local test
-- coordinator and worker running on the same host
-- basic CLI development
-
-Install Tailscale on Linux:
+**Linux:**
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
-```
-
-Start and authenticate Tailscale:
-
-```bash
 sudo tailscale up
 ```
 
-Verify the device has a Tailscale IP:
+**macOS:**
 
 ```bash
-tailscale ip -4
+brew install --cask tailscale
+open -a Tailscale
+# sign in via the menu bar icon
 ```
 
-Check peer visibility:
+**Windows:** download from <https://tailscale.com/download/windows> and sign
+in.
+
+Confirm all machines are on the same tailnet:
 
 ```bash
 tailscale status
 ```
 
-Official Tailscale Linux installation documentation:
+You should see every machine listed. Note the `100.x.y.z` address of the one
+you'll use as coordinator — call it `COORD_IP` below.
 
-```text
-https://tailscale.com/docs/install/linux
-```
-
-Use the coordinator machine's Tailscale IP when initializing a worker:
+### 1. Coordinator node (Machine A)
 
 ```bash
-relay init --role worker --coordinator http://100.x.y.z:8080
+relay init --role dual --network tailscale --model qwen2.5-3b
+relay start
+relay status
 ```
 
-Relay does not currently install Tailscale, run `tailscale up`, or manage
-Tailscale authentication.
+What this does:
+- `--role dual` runs coordinator + worker + etcd + membership-etcd on this
+  machine.
+- `--network tailscale` makes the node auto-advertise its Tailscale IP.
+- `--model qwen2.5-3b` (or any catalog entry) is downloaded for the local
+  worker. Skip with `--skip-model` if you only want this node to coordinate.
+
+`relay status` should show `etcd`, `membership-etcd`, `coordinator`, and
+`worker` all running, plus a health summary. Confirm the coordinator HTTP
+endpoint:
+
+```bash
+curl -s http://127.0.0.1:8080/health
+# {"status":"ok","nodeId":"...","isLeader":true}
+```
+
+Note the Tailscale IP for the next step:
+
+```bash
+tailscale ip -4
+# 100.64.1.23   ← use this as COORD_IP
+```
+
+### 2. Worker nodes (Machine B, C, …)
+
+On each additional machine:
+
+```bash
+relay init --role worker \
+    --network tailscale \
+    --coordinator http://COORD_IP:8080 \
+    --model qwen2.5-3b
+relay start
+relay status
+```
+
+Notes:
+- Each worker downloads its own model. You can give different workers
+  different models — the scheduler routes by `model` field in the request
+  (or picks any worker when `model` is omitted).
+- The first chat request to a worker is slow because `llama-server` is
+  started lazily. Subsequent requests on the same worker are fast.
+- The worker registers in the coordinator's etcd over Tailscale and starts
+  publishing telemetry every 200 ms.
+
+### 3. Verify the cluster from anywhere on the tailnet
+
+```bash
+curl -s http://COORD_IP:8080/v1/workers | python3 -m json.tool
+```
+
+You should see one entry per worker with its Tailscale address, advertised
+models, and live telemetry (`qw`, `mw`, `jw`, `theta_w`).
+
+OpenAI-shaped model list (used by Open WebUI etc.):
+
+```bash
+curl -s http://COORD_IP:8080/v1/models | python3 -m json.tool
+```
+
+### 4. Test a chat completion
+
+**Streaming via `curl`:**
+
+```bash
+curl -N http://COORD_IP:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "qwen2.5-3b",
+      "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+      "max_tokens": 32
+    }'
+```
+
+Inspect the response headers to see which worker handled it:
+
+```bash
+curl -sI http://COORD_IP:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"qwen2.5-3b","messages":[{"role":"user","content":"hi"}]}'
+# X-Relay-Worker: worker-node-b
+# X-Relay-Cost: 0.3214
+# X-Relay-Matched-Tokens: 0
+# X-Relay-Attempts: 1
+```
+
+**Streaming via the dashboard** (recommended for live debugging):
+
+On any machine that can reach `COORD_IP` over Tailscale:
+
+```bash
+relay dashboard --coordinator http://COORD_IP:8080
+```
+
+The browser opens at `http://127.0.0.1:8090`. The left sidebar shows every
+worker live (`q_w` / `m_w` / `j_w` / `θ_w` bars), the right panel shows the
+scheduler decision per request, and each assistant bubble shows which worker
+served it. If retries happen, you'll see an `N tries` pill on the bubble.
+
+### 5. Test failure: kill a worker mid-cluster
+
+On one worker machine:
+
+```bash
+kill -9 $(cat ~/.relay/run/worker.pid)
+```
+
+Then:
+- Within ~10 seconds, that worker disappears from `curl /v1/workers` (its
+  etcd lease expired — see [src/membership/etcd-go/main.go](src/membership/etcd-go/main.go)).
+- If you send a chat right after the kill but before the lease expires,
+  the coordinator's retry helper catches the connect failure and picks
+  another worker. The dashboard shows the response with a `2 tries` pill.
+- If you kill **every** worker, `/v1/chat/completions` returns a clean 503
+  `"All eligible workers unreachable"` instead of hanging.
+
+Bring the dead worker back:
+
+```bash
+relay start
+```
+
+Within seconds it re-registers in etcd and the dashboard sidebar shows it
+again.
+
+### 6. Connect Open WebUI (optional)
+
+In Open WebUI → Settings → Connections → OpenAI API → Add Connection:
+
+- **Base URL:** `http://COORD_IP:8080/v1`
+- **API key:** anything (e.g. `relay`) — the coordinator does not validate
+  the `Authorization` header.
+- The model dropdown auto-populates from `/v1/models`.
+
+Each message round-trips through the coordinator's scheduler exactly like a
+dashboard chat.
+
+### Common gotchas
+
+- **`tailscale: command not found`** — Tailscale isn't installed on this
+  machine. Relay does not auto-install it; see step 0.
+- **`Worker unreachable` in the dashboard** — the worker's published
+  `address` isn't reachable from the coordinator. On Tailscale this almost
+  always means `tailscale up` wasn't run on the worker before `relay init`,
+  so the worker registered with `127.0.0.1` instead of `100.x.y.z`. Run
+  `relay stop`, then `relay init` again (it now overwrites the config
+  automatically) and re-`relay start`.
+- **Model dropdown empty in dashboard/Open WebUI** — no worker has finished
+  registering yet, or none have a model loaded. Check `relay status` and
+  `relay logs worker` on each worker.
+- **First request very slow** — expected. The worker starts `llama-server`
+  lazily on the first inference call. Subsequent calls reuse it.
+- **`Port 8080/8090 is already in use`** — pass `--port` to the relevant
+  command, or stop the conflicting service.
+- **etcd refuses to start with "cluster ID mismatch"** — old etcd data from
+  a previous init. `relay init` already wipes `~/.relay/etcd-data/`
+  automatically, so just re-run `relay init` and then `relay start`.
+
+### Switching back to a LAN-only setup
+
+You don't strictly need Tailscale if every machine can reach each other on
+the LAN. Replace `--network tailscale` with `--network lan` and pass the
+explicit LAN IP via `--host`:
+
+```bash
+# On coordinator
+relay init --role dual --network lan --host 192.168.1.10 --node-id home-server
+# On worker
+relay init --role worker --network lan --host 192.168.1.11 \
+    --coordinator http://192.168.1.10:8080 --node-id laptop-worker
+```
+
+LAN auto-discovery (mDNS) is not wired into the scheduling path today, so
+you must pass `--host` on each node. Workers still discover each other
+through etcd, identical to the Tailscale case.
 
 ## Development Commands
 

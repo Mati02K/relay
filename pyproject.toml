@@ -44,6 +44,11 @@ membership = [
     "etcd-go/main.go",
     "etcd-go/membership/*.go",
 ]
+dashboard = [
+    "static/*.html",
+    "static/*.css",
+    "static/*.js",
+]
 
 [tool.ruff]
 line-length = 100

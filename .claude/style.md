@@ -2,79 +2,89 @@
 
 ## Formatter and Linter
 
-Ruff. Run before every commit:
+Use Ruff.
+
 ```bash
-ruff check . && ruff format .
+.venv/bin/ruff check src
+.venv/bin/ruff format --check src
 ```
 
-Config in `pyproject.toml`:
+Project config is in `pyproject.toml`:
+
 ```toml
 [tool.ruff]
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]   # N (pep8-naming) disabled — project uses camelCase
+select = ["E", "F", "I"]
 ```
 
 ## Naming
 
-| Thing | Convention | Example |
-|---|---|---|
-| Variables | camelCase | `nodeId`, `myAddress`, `memberList` |
-| Functions / methods | camelCase | `getMyAddress()`, `electLeader()` |
-| Classes | PascalCase | `EtcdMembership`, `TailscaleNetwork` |
-| Module-level constants | UPPER_SNAKE_CASE | `SERVICE_TYPE`, `BROWSE_TIMEOUT_SECONDS` |
+The current codebase is mixed because older modules use camelCase and newer
+runtime/telemetry modules use snake_case. Match the file you are editing.
 
-Standard Python `snake_case` is **not** used in this project.
+Guidelines:
+
+- New modules should use standard Python `snake_case` for functions, methods, and variables.
+- Existing camelCase FastAPI handlers or legacy membership/network methods may stay camelCase.
+- Classes use `PascalCase`.
+- Module constants use `UPPER_SNAKE_CASE`.
+- Do not rename public functions only for style unless the task asks for a migration.
 
 ## Type Hints
 
-Every `def` and `async def` must be fully annotated — parameters and return type. Run `mypy src/` to verify:
+Every `def` and `async def` should have parameter and return annotations.
+
+Use focused mypy checks for the edited area:
+
 ```bash
-mypy src/
+.venv/bin/mypy src/relay src/coordinator src/telemetry src/worker/daemon.py src/worker/main.py src/worker/inference
 ```
 
-Config:
-```toml
-[tool.mypy]
-python_version = "3.11"
-strict = true
-```
+Avoid `Any` unless the boundary really is untyped JSON, FastAPI request data, or external metadata.
 
-No `Any` types unless there is no alternative.
+## Async and I/O
 
-## Async
+Use async APIs in async paths:
 
-All I/O-bound code uses `async/await`:
-- gRPC calls → `grpc.aio` channel and stubs
-- HTTP calls → `httpx.AsyncClient`
-- FastAPI handlers → always `async def`
+- HTTP: `httpx.AsyncClient`
+- FastAPI handlers: `async def`
+- gRPC client calls: `grpc.aio`
 
-Never call blocking I/O directly inside an async function. If a library is sync-only, use `asyncio.run_in_executor`.
+Do not add blocking network or subprocess waits inside an async request path unless wrapped appropriately.
 
 ## Data Models
 
-Use `pydantic.BaseModel` for all request/response schemas and config objects passed across layer or function boundaries. Do not pass raw `dict` between layers.
+Use Pydantic models for persistent config and cross-layer schemas:
 
-```python
-class ChatRequest(BaseModel):
-    messages: list[Message]
-```
+- `src/relay/config.py`
+- `src/telemetry/schemas.py`
+- FastAPI response models where practical
 
-## Docstrings
+OpenAI-compatible request bodies and membership metadata are partly dynamic JSON,
+so carefully validate raw `dict[str, object]` at those boundaries.
 
-Every `def` and `async def` gets **exactly one short docstring line** explaining what the function does — not how. This line describes the function's purpose, not a step-by-step of the implementation.
+## Docstrings and Comments
 
-```python
-async def register(self, nodeId: str, metadata: dict) -> None:
-    """Register this node in the cluster with the given metadata."""
-```
+Docstrings should explain purpose and important contracts. Short one-line
+docstrings are fine for simple helpers. Multi-line docstrings are acceptable
+when the function encodes scheduling math, telemetry meaning, lifecycle rules,
+or non-obvious behavior.
 
-No multi-line docstrings. No `Args:` / `Returns:` blocks.
+Use comments sparingly. Add comments for:
 
-## What Not to Do
+- scheduling formula terms
+- process lifecycle ordering
+- telemetry source boundaries
+- compatibility or workaround details
 
-- No `print()` statements (use `logging` if needed)
-- No commented-out code
-- No emojis anywhere in source files
-- No inline comments unless the logic is genuinely non-obvious to a reader (e.g. a tricky invariant or a workaround for a specific library bug)
+Do not add comments that merely restate the code.
+
+## Source Hygiene
+
+- No commented-out code.
+- No emojis in source files or docs unless explicitly requested.
+- Do not commit generated `__pycache__`, `.mypy_cache`, `.ruff_cache`, or `.pytest_cache`.
+- Do not silently replace the scheduler formula with a different heuristic.
+- Do not reintroduce the removed local Python membership service as the default path.

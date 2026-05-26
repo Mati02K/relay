@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from relay.paths import RelayPaths
 
-NodeRole = Literal["coordinator", "worker", "all"]
+NodeRole = Literal["coordinator", "worker", "dual"]
 NetworkBackend = Literal["tailscale", "lan"]
 MembershipBackend = Literal["etcd"]
 EngineName = Literal["llama.cpp"]
@@ -93,7 +93,7 @@ class RelayConfig(BaseModel):
     version: int = 1
     node_id: str = Field(default_factory=lambda: socket.gethostname() or "relay-node")
     cluster_id: str = Field(default_factory=lambda: f"relay-{uuid.uuid4().hex[:8]}")
-    role: NodeRole = "all"
+    role: NodeRole = "dual"
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     membership: MembershipConfig = Field(default_factory=MembershipConfig)
     coordinator: CoordinatorConfig = Field(default_factory=CoordinatorConfig)
@@ -104,12 +104,12 @@ class RelayConfig(BaseModel):
     @property
     def runs_coordinator(self) -> bool:
         """Return whether this node starts a coordinator process."""
-        return self.role in {"coordinator", "all"}
+        return self.role in {"coordinator", "dual"}
 
     @property
     def runs_worker(self) -> bool:
         """Return whether this node starts a worker process."""
-        return self.role in {"worker", "all"}
+        return self.role in {"worker", "dual"}
 
     def active_model(self) -> ModelConfig | None:
         """Return the first loaded model for the node, if any."""

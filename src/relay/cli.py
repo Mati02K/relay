@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from relay.supervisor import (
     status,
     stop,
 )
+from relay.ui import accent, banner, err, muted, ok, status_label, warn
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except (ConfigError, SupervisorError, RuntimeError) as e:
-        print(f"error: {e}", file=sys.stderr)
+        print(f"{err('error:')} {e}", file=sys.stderr)
         return 1
 
 
@@ -39,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_parser = sub.add_parser("init", help="create local Relay config")
-    init_parser.add_argument("--role", choices=("coordinator", "worker", "all"))
+    init_parser.add_argument("--role", choices=("coordinator", "worker", "dual"))
     init_parser.add_argument("--network", choices=("tailscale", "lan"))
     init_parser.add_argument("--coordinator", help="coordinator URL/IP for worker nodes")
     init_parser.add_argument("--node-id")
@@ -47,7 +49,6 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--model", help="catalog model id to pull")
     init_parser.add_argument("--model-path", help="local GGUF model path")
     init_parser.add_argument("--skip-model", action="store_true")
-    init_parser.add_argument("--force", action="store_true")
     init_parser.set_defaults(func=_cmd_init)
 
     start_parser = sub.add_parser("start", help="start configured Relay processes")
@@ -81,10 +82,37 @@ def _build_parser() -> argparse.ArgumentParser:
     models_list.add_argument("--catalog", action="store_true")
     models_list.set_defaults(func=_cmd_models_list)
 
+    dashboard_parser = sub.add_parser(
+        "dashboard",
+        help="launch the testing dashboard (chat UI + worker telemetry)",
+    )
+    dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("RELAY_DASHBOARD_PORT", "8090")),
+        help="HTTP port to bind (default 8090, env RELAY_DASHBOARD_PORT)",
+    )
+    dashboard_parser.add_argument(
+        "--host",
+        default=os.getenv("RELAY_DASHBOARD_HOST", "127.0.0.1"),
+        help="HTTP host to bind (default 127.0.0.1)",
+    )
+    dashboard_parser.add_argument(
+        "--coordinator",
+        help="coordinator base URL (default: from config or http://127.0.0.1:8080)",
+    )
+    dashboard_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="don't open a browser automatically",
+    )
+    dashboard_parser.set_defaults(func=_cmd_dashboard)
+
     return parser
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    print(banner(), end="")
     config = run_init(
         InitOptions(
             role=args.role,
@@ -95,22 +123,25 @@ def _cmd_init(args: argparse.Namespace) -> int:
             model=args.model,
             model_path=args.model_path,
             skip_model=bool(args.skip_model),
-            force=bool(args.force),
         )
     )
-    print(f"Config written to {RelayPaths.from_home().config}")
-    print(f"Role: {config.role}")
+    print(f"{ok('config:')} {RelayPaths.from_home().config}")
+    print(f"{accent('role:')}   {config.role}")
     if config.runs_worker and not config.models:
-        print("No model configured yet. Run `relay pull <model>` or register a local GGUF.")
+        print(
+            warn("note:"),
+            "no model configured. Run `relay pull <model>` or register a local GGUF.",
+        )
     return 0
 
 
 def _cmd_start(args: argparse.Namespace) -> int:
     config = load_config()
+    print(banner(), end="")
     statuses = start(config, foreground=bool(args.foreground))
     for item in statuses:
-        pid = f" pid={item.pid}" if item.pid else ""
-        print(f"{item.name}: {item.detail}{pid}")
+        pid = muted(f" pid={item.pid}") if item.pid else ""
+        print(f"{accent(item.name + ':'):24} {ok(item.detail)}{pid}")
     return 0
 
 
@@ -120,8 +151,9 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     except ConfigError:
         config = None
     for item in stop(config):
-        pid = f" pid={item.pid}" if item.pid else ""
-        print(f"{item.name}: {item.detail}{pid}")
+        pid = muted(f" pid={item.pid}") if item.pid else ""
+        label = muted(item.detail) if "no pid" in item.detail else ok(item.detail)
+        print(f"{accent(item.name + ':'):24} {label}{pid}")
     return 0
 
 
@@ -135,9 +167,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(process_status_json(statuses))
     else:
         for item in statuses:
-            pid = item.pid if item.pid is not None else "-"
-            state = "running" if item.running else "stopped"
-            print(f"{item.name:16} {state:8} pid={pid}")
+            pid_text = str(item.pid) if item.pid is not None else "-"
+            state = status_label(item.running, item.detail)
+            print(f"{accent(item.name + ':'):24} {state:24} {muted('pid=' + pid_text)}")
     if config is not None and any(item.running for item in statuses):
         health = health_summary(config)
         if health:
@@ -180,6 +212,30 @@ def _cmd_pull(args: argparse.Namespace) -> int:
     config, model = pull_catalog_model(config, str(args.model))
     save_config(config)
     print(f"Downloaded {model.id}: {model.path}")
+    return 0
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from dashboard.server import PortInUseError, run_dashboard
+
+    coordinator_url = args.coordinator
+    if not coordinator_url:
+        try:
+            config = load_config()
+            coordinator_url = config.coordinator.url
+        except ConfigError:
+            coordinator_url = "http://127.0.0.1:8080"
+
+    try:
+        run_dashboard(
+            host=str(args.host),
+            port=int(args.port),
+            coordinator_url=str(coordinator_url),
+            open_browser=not bool(args.no_open),
+        )
+    except PortInUseError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 

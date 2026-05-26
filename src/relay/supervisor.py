@@ -131,6 +131,10 @@ def _managed_pid_paths(config: RelayConfig | None, paths: RelayPaths) -> list[Pa
         names.append("coordinator")
     if config.runs_worker:
         names.append("worker")
+    # Dashboard is launched ad-hoc via `relay dashboard`, not by `relay start`,
+    # so include its pid file only when one is actually present.
+    if (paths.run / "dashboard.pid").exists():
+        names.append("dashboard")
     return [paths.run / f"{name}.pid" for name in names]
 
 

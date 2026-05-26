@@ -23,6 +23,12 @@ class EtcdMembership(MembershipLayer):
         """Open an async gRPC channel to the membership-etcd server."""
         self._channel = grpc.aio.insecure_channel(f"{host}:{port}")
         self._stub = relay_pb2_grpc.MembershipServiceStub(self._channel)
+        self._leaseId: int | None = None
+        self._leaseStream: (
+            grpc.aio.UnaryStreamCall[relay_pb2.LeaseRequest, relay_pb2.LeaseStatus] | None
+        ) = None
+        self._leaseTask: asyncio.Task[None] | None = None
+        self._leaseReady: asyncio.Event = asyncio.Event()
         logger.info("EtcdMembership channel opened | target={}:{}", host, port)
 
     async def register(self, nodeId: str, metadata: dict) -> None:
@@ -92,7 +98,54 @@ class EtcdMembership(MembershipLayer):
         logger.debug("etcd getByPrefix | prefix={} count={}", prefix, len(result))
         return result
 
+    async def holdLease(self, ttlSeconds: int = 10) -> int:
+        """Grant a session-backed lease via HoldLease and keep the stream alive."""
+        if self._leaseTask is not None:
+            await self._leaseReady.wait()
+            assert self._leaseId is not None
+            return self._leaseId
+        self._leaseTask = asyncio.create_task(self._runLeaseStream(ttlSeconds))
+        await self._leaseReady.wait()
+        if self._leaseId is None:
+            raise RuntimeError("HoldLease did not produce a lease id")
+        return self._leaseId
+
+    async def _runLeaseStream(self, ttlSeconds: int) -> None:
+        """Hold the HoldLease server-stream open until the channel closes."""
+        try:
+            self._leaseStream = self._stub.HoldLease(relay_pb2.LeaseRequest(ttl_seconds=ttlSeconds))
+            async for status in self._leaseStream:
+                if status.lease_id and self._leaseId is None:
+                    self._leaseId = int(status.lease_id)
+                    logger.info("HoldLease granted | leaseId={}", self._leaseId)
+                    self._leaseReady.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("HoldLease stream terminated")
+        finally:
+            # If the stream died before yielding, unblock the waiter so the
+            # caller can see the failure instead of hanging forever.
+            self._leaseReady.set()
+
+    async def putWithLease(self, key: str, value: str) -> None:
+        """Write a key bound to the currently-held lease."""
+        if self._leaseId is None:
+            raise RuntimeError("putWithLease called before holdLease")
+        await self._stub.PutWithLease(
+            relay_pb2.LeaseKVPair(key=key, value=value, lease_id=self._leaseId)
+        )
+        logger.debug("etcd putWithLease | key={} leaseId={}", key, self._leaseId)
+
     async def close(self) -> None:
-        """Close the gRPC channel."""
+        """Close the gRPC channel, revoking any held lease via stream cancellation."""
+        if self._leaseTask is not None:
+            self._leaseTask.cancel()
+            try:
+                await self._leaseTask
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._leaseTask = None
+            self._leaseId = None
         await self._channel.close()
         logger.info("EtcdMembership gRPC channel closed")
