@@ -6,16 +6,35 @@ from typing import AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from loguru import logger
 
 import logger as loggerSetup
 from membership.etcd import EtcdMembership
+from worker.inference.llamacpp import LlamaCppEngine
 
 NODE_ID: str = os.getenv("NODE_ID", "worker")
+WORKER_PORT: int = int(os.getenv("WORKER_PORT", "9090"))
 ACTIVE_COORDINATOR_KEY: str = "/relay/active-coordinator"
 
 membershipClient: EtcdMembership | None = None
 _coordinatorUrl: str | None = None
+# Created on startup; model subprocess is launched lazily on the first /v1/generate call.
+inferenceEngine: LlamaCppEngine | None = None
+
+
+def _resolveWorkerHost() -> str:
+    """Pick this worker's reachable host: WORKER_HOST env > Tailscale IP > 127.0.0.1 fallback."""
+    explicit = os.getenv("WORKER_HOST")
+    if explicit:
+        return explicit
+    try:
+        from network.tailscale import TailscaleNetwork
+
+        return TailscaleNetwork().getMyAddress()
+    except Exception:
+        logger.warning("Could not resolve Tailscale address, falling back to 127.0.0.1")
+        return "127.0.0.1"
 
 
 async def _watchCoordinator() -> None:
@@ -38,16 +57,51 @@ async def _watchCoordinator() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Set up logging, membership client, and coordinator discovery on startup."""
-    global membershipClient
+    """Set up logging, membership client, coordinator discovery, and inference engine on startup."""
+    global membershipClient, inferenceEngine
     loggerSetup.setup()
     membershipClient = EtcdMembership(
         host=os.getenv("MEMBERSHIP_HOST", "localhost"),
         port=int(os.getenv("MEMBERSHIP_PORT", "50051")),
     )
+    inferenceEngine = LlamaCppEngine()
+
+    workerHost = _resolveWorkerHost()
+    workerUrl = f"http://{workerHost}:{WORKER_PORT}"
+    metadata: dict = {"role": "worker", "ip": workerHost, "url": workerUrl}
+    # Optional self-described compute strength (0..1); read by the phase-aware
+    # term in the scheduler. Defaults are 0.5 in scheduler if not provided.
+    compute_strength_raw = os.getenv("RELAY_COMPUTE_STRENGTH")
+    if compute_strength_raw:
+        try:
+            metadata["compute_strength"] = max(0.0, min(1.0, float(compute_strength_raw)))
+        except ValueError:
+            logger.warning("Invalid RELAY_COMPUTE_STRENGTH | raw={}", compute_strength_raw)
+    # Self-described model quality (0..1); consumed by the quality-aware (nu)
+    # cost term so the scheduler can route complex prompts to higher-quality
+    # workers in the RouteLLM sense. Defaults to 0.5 in the scheduler if unset.
+    model_quality_raw = os.getenv("RELAY_MODEL_QUALITY")
+    if model_quality_raw:
+        try:
+            metadata["model_quality"] = max(0.0, min(1.0, float(model_quality_raw)))
+        except ValueError:
+            logger.warning("Invalid RELAY_MODEL_QUALITY | raw={}", model_quality_raw)
+    await membershipClient.register(NODE_ID, metadata)
+
     asyncio.create_task(_watchCoordinator())
-    logger.info("Worker started | nodeId={}", NODE_ID)
+    logger.info(
+        "Worker started | nodeId={} url={} engineModel={}",
+        NODE_ID,
+        workerUrl,
+        inferenceEngine._model_path or "<unset>",
+    )
     yield
+    try:
+        await membershipClient.deregister(NODE_ID)
+    except Exception:
+        logger.exception("Failed to deregister worker | nodeId={}", NODE_ID)
+    if inferenceEngine is not None:
+        await inferenceEngine.stop()
     await membershipClient.close()
     logger.info("Worker shutting down | nodeId={}", NODE_ID)
 
@@ -131,3 +185,31 @@ async def listMessages() -> dict:
 async def getMessage(msgId: str) -> dict:
     """Forward a get-message request to the active coordinator."""
     return await _forward("GET", f"/v1/messages/{msgId}")
+
+
+# ---------------------------------------------------------------------------
+# Data-plane endpoints (called BY the coordinator's scheduler, not by clients)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/telemetry")
+async def telemetry() -> dict:
+    """Return the current inference engine telemetry snapshot for the scheduler."""
+    if inferenceEngine is None:
+        raise HTTPException(status_code=503, detail="Inference engine not initialized")
+    snapshot = await inferenceEngine.get_telemetry()
+    return snapshot.model_dump()
+
+
+@app.post("/v1/generate")
+async def generate(request: Request) -> StreamingResponse:
+    """Stream a chat completion from this worker's inference engine (OpenAI-compatible SSE)."""
+    if inferenceEngine is None:
+        raise HTTPException(status_code=503, detail="Inference engine not initialized")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return StreamingResponse(
+        inferenceEngine.generate(body),
+        media_type="text/event-stream",
+    )

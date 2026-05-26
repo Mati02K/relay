@@ -26,6 +26,9 @@ dev = [
     "pytest-asyncio>=0.23",
     "uv>=0.4",
 ]
+bench = [
+    "matplotlib>=3.9",
+]
 
 [tool.setuptools.package-dir]
 "" = "src"

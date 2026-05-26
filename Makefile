@@ -8,7 +8,9 @@ proto:
 		--grpc_python_out=src/membership \
 		proto/relay.proto
 	@# grpc_tools generates absolute imports; fix to relative for package use.
-	sed -i 's/^import relay_pb2/from . import relay_pb2/' src/membership/relay_pb2_grpc.py
+	@# Use -i.bak form for BSD/GNU sed portability (macOS + Linux).
+	sed -i.bak 's/^import relay_pb2/from . import relay_pb2/' src/membership/relay_pb2_grpc.py
+	rm -f src/membership/relay_pb2_grpc.py.bak
 
 	@echo "Generating Go gRPC stubs..."
 	mkdir -p src/membership/etcd-go/membership

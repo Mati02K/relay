@@ -6,19 +6,32 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
 import logger as loggerSetup
+from coordinator.scheduler import (
+    CostWeights,
+    estimate_ttft_ms,
+    messages_to_prompt_text,
+    pick_worker,
+)
+from coordinator.worker_registry import WorkerRegistry
 from membership.etcd import EtcdMembership
 from network.tailscale import TailscaleNetwork
+from worker.inference.base import estimate_tokens_from_text
+
+_TTFT_SLO_MS: float = float(os.getenv("RELAY_TTFT_SLO_MS", "0"))
 
 NODE_ID: str = os.getenv("NODE_ID", "coordinator")
 COORDINATOR_PORT: int = int(os.getenv("COORDINATOR_PORT", "8080"))
 ACTIVE_COORDINATOR_KEY: str = "/relay/active-coordinator"
 
 membershipClient: EtcdMembership | None = None
+workerRegistry: WorkerRegistry | None = None
 _isActive: bool = False
 
 
@@ -71,10 +84,23 @@ async def _leadershipLoop(membership: EtcdMembership, myAddr: str) -> None:
             await asyncio.sleep(3)
 
 
+def _resolveCoordinatorAddress() -> tuple[str, str]:
+    """Pick this coordinator's reachable address; falls back to localhost if Tailscale is absent."""
+    explicit = os.getenv("COORDINATOR_HOST")
+    if explicit:
+        return explicit, f"http://{explicit}:{COORDINATOR_PORT}"
+    try:
+        ip = TailscaleNetwork().getMyAddress()
+        return ip, f"http://{ip}:{COORDINATOR_PORT}"
+    except Exception:
+        logger.warning("Could not resolve Tailscale address, falling back to 127.0.0.1")
+        return "127.0.0.1", f"http://127.0.0.1:{COORDINATOR_PORT}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Set up logging, membership, and leadership campaign on startup."""
-    global membershipClient
+    """Set up logging, membership, leadership, and worker telemetry registry on startup."""
+    global membershipClient, workerRegistry
 
     loggerSetup.setup()
     log = logger.bind(nodeId=NODE_ID)
@@ -83,21 +109,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         host=os.getenv("MEMBERSHIP_HOST", "localhost"),
         port=int(os.getenv("MEMBERSHIP_PORT", "50051")),
     )
-    networkLayer = TailscaleNetwork()
 
-    myAddress = networkLayer.getMyAddress()
-    myAddr = f"http://{os.getenv('COORDINATOR_HOST', myAddress)}:{COORDINATOR_PORT}"
+    myAddress, myAddr = _resolveCoordinatorAddress()
     log.info("Coordinator starting | addr={}", myAddr)
 
     await membershipClient.register(NODE_ID, {"role": "coordinator", "ip": myAddress})
     log.info("Registered in membership layer | nodeId={}", NODE_ID)
 
-    # Start leader election in background — does not block startup.
+    workerRegistry = WorkerRegistry(membershipClient)
+    workerRegistry.start()
+
     asyncio.create_task(_leadershipLoop(membershipClient, myAddr))
 
     yield
 
     log.info("Coordinator shutting down | nodeId={}", NODE_ID)
+    if workerRegistry is not None:
+        await workerRegistry.stop()
     await membershipClient.put(ACTIVE_COORDINATOR_KEY, "")
     await membershipClient.deregister(NODE_ID)
     await membershipClient.close()
@@ -134,16 +162,111 @@ async def health() -> HealthResponse:
     return HealthResponse(status="ok", nodeId=NODE_ID, isLeader=_isActive)
 
 
-@app.post("/v1/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
-    """Store a chat request in etcd; only the active coordinator accepts this."""
+@app.get("/v1/cluster")
+async def clusterView() -> dict:
+    """Debug view of the live worker telemetry registry (paper §3.2 inputs)."""
+    if workerRegistry is None:
+        raise HTTPException(status_code=503, detail="Worker registry not initialized")
+    snapshot = workerRegistry.snapshot()
+    return {
+        "workers": [
+            {
+                "nodeId": state.node_id,
+                "url": state.url,
+                "online": state.online,
+                "rttMsEma": round(state.rtt_ms_ema, 2),
+                "jitterMsEma": round(state.jitter_ms_ema, 2),
+                "consecutiveFailures": state.consecutive_failures,
+                "lastSeenMsAgo": round(
+                    (time.monotonic() * 1000 - state.last_seen_ms), 1
+                ) if state.last_seen_ms > 0 else None,
+                "telemetry": state.telemetry.model_dump(),
+                "metadata": state.metadata,
+            }
+            for state in snapshot.values()
+        ]
+    }
+
+
+@app.post("/v1/chat")
+async def chat(request: Request) -> StreamingResponse:
+    """Schedule a chat request to the best worker and stream the response back to the client."""
     _requireActive()
-    assert membershipClient is not None
-    msgId = str(uuid.uuid4())
-    payload = {"messages": [m.model_dump() for m in request.messages]}
-    await membershipClient.put(f"/relay/messages/{msgId}", json.dumps(payload))
-    logger.info("Message stored | id={} messageCount={}", msgId, len(request.messages))
-    return ChatResponse(id=msgId, stored=True)
+    assert workerRegistry is not None
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    messages = body.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="`messages` must be a non-empty list")
+
+    workers = workerRegistry.online_workers()
+    if not workers:
+        raise HTTPException(status_code=503, detail="No healthy workers available")
+
+    prompt_text = messages_to_prompt_text(messages)
+    weights = CostWeights.from_env()
+    winner_id, breakdowns = pick_worker(prompt_text, workers, weights=weights)
+    if winner_id is None:
+        raise HTTPException(status_code=503, detail="Scheduler could not select a worker")
+
+    winner = workers[winner_id]
+
+    if _TTFT_SLO_MS > 0:
+        prompt_tokens = estimate_tokens_from_text(prompt_text)
+        predicted_ttft_ms = estimate_ttft_ms(winner, prompt_tokens)
+        if predicted_ttft_ms > _TTFT_SLO_MS:
+            logger.warning(
+                "Shedding request | nodeId={} predictedTtftMs={:.0f} sloMs={:.0f}",
+                winner_id,
+                predicted_ttft_ms,
+                _TTFT_SLO_MS,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Predicted TTFT {predicted_ttft_ms:.0f}ms exceeds SLO {_TTFT_SLO_MS:.0f}ms",
+            )
+
+    request_id = str(uuid.uuid4())
+    winner_breakdown = next(b for b in breakdowns if b.node_id == winner_id)
+    logger.info(
+        "Routing chat | reqId={} winner={} overlap={:.2f} cost={:.4f} candidates={}",
+        request_id,
+        winner_id,
+        winner_breakdown.overlap,
+        winner_breakdown.total,
+        len(workers),
+    )
+
+    async def _stream_from_worker() -> AsyncGenerator[bytes, None]:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+            async with client.stream(
+                "POST",
+                f"{winner.url}/v1/generate",
+                json=body,
+                headers={"Accept": "text/event-stream"},
+            ) as upstream:
+                if upstream.status_code >= 400:
+                    err = (await upstream.aread()).decode(errors="replace")
+                    logger.error(
+                        "Upstream worker error | reqId={} nodeId={} status={} body={}",
+                        request_id,
+                        winner_id,
+                        upstream.status_code,
+                        err[:500],
+                    )
+                    yield f"data: {{\"error\": \"upstream {upstream.status_code}\"}}\n\n".encode()
+                    return
+                async for chunk in upstream.aiter_raw():
+                    if chunk:
+                        yield chunk
+
+    return StreamingResponse(
+        _stream_from_worker(),
+        media_type="text/event-stream",
+        headers={"X-Relay-Worker": winner_id, "X-Relay-Request-Id": request_id},
+    )
 
 
 @app.get("/v1/messages", response_model=dict)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import platform
 import shutil
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -35,6 +36,94 @@ _METRICS_CANDIDATES_Q: Final[tuple[str, ...]] = (
     "llamacpp:requests_processing",
     "llamacpp_requests_processing",
 )
+_THERMAL_CACHE_TTL_S: Final[float] = float(os.getenv("RELAY_THERMAL_TTL_S", "2.0"))
+_NVIDIA_THROTTLE_THRESHOLD: Final[float] = 0.9
+
+# Single-host heterogeneity knobs used by the ablation study.
+# These override or perturb specific telemetry fields so one MacBook can stand in
+# for three "different" workers without lying about the underlying engine.
+_FAKE_THETA_W: Final[str] = os.getenv("RELAY_FAKE_THETA_W", "")
+_FAKE_QW_OFFSET: Final[int] = int(os.getenv("RELAY_FAKE_QW_OFFSET", "0"))
+_FAKE_MW: Final[str] = os.getenv("RELAY_FAKE_MW", "")
+_FAKE_TELEMETRY_DELAY_MS: Final[float] = float(os.getenv("RELAY_FAKE_TELEMETRY_DELAY_MS", "0"))
+# When >0, adds a uniform random sleep in [0, ms] before returning telemetry.
+# This injects real variance into coordinator-measured RTT and produces a
+# non-trivial j_w EMA so the delta term in the cost function is exercisable
+# on a single-host deployment.
+_FAKE_TELEMETRY_RANDOM_JITTER_MS: Final[float] = float(
+    os.getenv("RELAY_FAKE_TELEMETRY_RANDOM_JITTER_MS", "0")
+)
+
+
+async def _read_thermal_flag() -> int:
+    """Return 1 if this host's CPU/GPU appears thermally throttled, else 0.
+
+    Best-effort across platforms; failures silently return 0 (assume healthy).
+    """
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            return await _read_thermal_darwin()
+        if system == "Linux":
+            return await _read_thermal_linux()
+    except Exception as exc:
+        logger.debug("Thermal probe failed | system={} err={}", system, exc)
+    return 0
+
+
+async def _read_thermal_darwin() -> int:
+    """macOS: ``pmset -g therm`` exposes CPU_Speed_Limit < 100 when throttled."""
+    if not shutil.which("pmset"):
+        return 0
+    proc = await asyncio.create_subprocess_exec(
+        "pmset", "-g", "therm",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.0)
+    except TimeoutError:
+        proc.kill()
+        return 0
+    for raw_line in stdout.decode(errors="replace").splitlines():
+        line = raw_line.strip()
+        if line.startswith("CPU_Speed_Limit"):
+            value = line.split("=", 1)[-1].strip()
+            try:
+                return 1 if int(value) < 100 else 0
+            except ValueError:
+                return 0
+    return 0
+
+
+async def _read_thermal_linux() -> int:
+    """Linux + NVIDIA: nvidia-smi shows current vs max graphics clock when throttled."""
+    if not shutil.which("nvidia-smi"):
+        return 0
+    proc = await asyncio.create_subprocess_exec(
+        "nvidia-smi",
+        "--query-gpu=clocks.current.graphics,clocks.max.graphics",
+        "--format=csv,noheader,nounits",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.0)
+    except TimeoutError:
+        proc.kill()
+        return 0
+    for raw_line in stdout.decode(errors="replace").splitlines():
+        parts = [p.strip() for p in raw_line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            current = float(parts[0])
+            maximum = float(parts[1])
+        except ValueError:
+            continue
+        if maximum > 0 and current / maximum < _NVIDIA_THROTTLE_THRESHOLD:
+            return 1
+    return 0
 
 
 class LlamaCppEngine(InferenceEngine):
@@ -72,6 +161,9 @@ class LlamaCppEngine(InferenceEngine):
         self._sprefill_ema: float = 0.0
         self._prefix_hw: set[str] = set()
         self._max_hw_chunks: int = int(os.getenv("RELAY_KV_HASH_CACHE_CHUNKS", "512"))
+
+        self._thermal_value: int = 0
+        self._thermal_last_check: float = 0.0
 
     @property
     def base_url(self) -> str:
@@ -183,15 +275,46 @@ class LlamaCppEngine(InferenceEngine):
             except httpx.RequestError:
                 pass
 
+        theta_w = await self._cached_thermal_flag()
+
+        # Ablation knobs: override or perturb fields so co-located workers can
+        # play different roles in the experiment. Defaults are no-ops.
+        if _FAKE_THETA_W != "":
+            try:
+                theta_w = int(_FAKE_THETA_W)
+            except ValueError:
+                pass
+        if _FAKE_QW_OFFSET:
+            qw = max(0, qw + _FAKE_QW_OFFSET)
+        if _FAKE_MW != "":
+            try:
+                mw = max(0.0, min(1.0, float(_FAKE_MW)))
+            except ValueError:
+                pass
+        if _FAKE_TELEMETRY_DELAY_MS > 0:
+            await asyncio.sleep(_FAKE_TELEMETRY_DELAY_MS / 1000.0)
+        if _FAKE_TELEMETRY_RANDOM_JITTER_MS > 0:
+            import random
+            jitter_s = random.uniform(0, _FAKE_TELEMETRY_RANDOM_JITTER_MS) / 1000.0
+            await asyncio.sleep(jitter_s)
+
         return Telemetry(
             qw=qw,
             sw_by_bucket=dict(self._sw_by_bucket),
             mw=mw,
             jw=0.0,
-            theta_w=0,
+            theta_w=theta_w,
             prefix_chunk_hashes=sorted(self._prefix_hw),
             sprefill_tokens_per_sec=self._sprefill_ema,
         )
+
+    async def _cached_thermal_flag(self) -> int:
+        """Probe thermal state at most once every ``_THERMAL_CACHE_TTL_S`` seconds."""
+        now = time.monotonic()
+        if now - self._thermal_last_check >= _THERMAL_CACHE_TTL_S:
+            self._thermal_value = await _read_thermal_flag()
+            self._thermal_last_check = now
+        return self._thermal_value
 
     async def generate(self, request: Mapping[str, object]) -> AsyncIterator[str]:
         await self.start()
@@ -200,6 +323,12 @@ class LlamaCppEngine(InferenceEngine):
         body = dict(request)
         body.setdefault("model", "gpt-3.5-turbo")
         body["stream"] = True
+        # Force llama-server to emit a final usage chunk so we can compute decode tok/s.
+        existing_opts = body.get("stream_options")
+        if isinstance(existing_opts, dict):
+            existing_opts.setdefault("include_usage", True)
+        else:
+            body["stream_options"] = {"include_usage": True}
 
         messages = body.get("messages")
         prompt_text = _messages_to_text(messages) if isinstance(messages, list) else ""
