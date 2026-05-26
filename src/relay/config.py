@@ -55,6 +55,32 @@ class CoordinatorConfig(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class SchedulerConfig(BaseModel):
+    """Per-term weights for the paper-style scheduler cost function.
+
+    Each weight scales one signal that contributes to a worker's cost; the
+    scheduler picks the lowest-cost worker. Every weight is constrained to
+    ``[0.0, 1.0]``: ``1.0`` means full influence (the default), ``0.0`` means
+    that signal is ignored, and values in between dampen it. Pydantic
+    enforces the bound, so manual edits to ``config.json`` outside the range
+    will fail validation at load time.
+
+    The five weights map to the cost terms in ``src/coordinator/scheduler.py``:
+
+    * ``queue``       — punishes deep queues (relative to decode speed).
+    * ``prefix_miss`` — punishes prefix-cache misses (rewards cache hits).
+    * ``memory``      — punishes KV/RAM pressure on the worker.
+    * ``jitter``      — punishes flaky network paths.
+    * ``thermal``     — punishes thermally-throttled workers.
+    """
+
+    queue: float = Field(default=1.0, ge=0.0, le=1.0)
+    prefix_miss: float = Field(default=1.0, ge=0.0, le=1.0)
+    memory: float = Field(default=1.0, ge=0.0, le=1.0)
+    jitter: float = Field(default=1.0, ge=0.0, le=1.0)
+    thermal: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
 class WorkerConfig(BaseModel):
     """Worker HTTP API settings."""
 
@@ -97,6 +123,7 @@ class RelayConfig(BaseModel):
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     membership: MembershipConfig = Field(default_factory=MembershipConfig)
     coordinator: CoordinatorConfig = Field(default_factory=CoordinatorConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
     models: list[ModelConfig] = Field(default_factory=list)

@@ -2,7 +2,7 @@
 
 Maps ``(os, gpu_in_use)`` to the right set of concrete collectors:
 
-* Linux  : CPU sysfs counters + NVIDIA NVML when the model offloads to GPU.
+* Linux  : CPU sysfs counters + NVIDIA/AMD telemetry when the model uses GPU.
 * macOS  : ``NSProcessInfo.thermalState`` only — CPU and GPU share the envelope.
 * Windows: WMI thermal zones (admin) + NVIDIA NVML when the model offloads to GPU.
 
@@ -16,6 +16,7 @@ import platform
 
 from loguru import logger
 
+from telemetry.thermal.amd import AmdGpuSysfsCollector
 from telemetry.thermal.apple import MacOSThermalStateCollector
 from telemetry.thermal.base import NullThermalCollector, ThermalCollector
 from telemetry.thermal.linux import LinuxCpuThrottleCollector
@@ -44,6 +45,9 @@ def detect_thermal_collectors(
             nvml = NvidiaNvmlCollector.try_create()
             if nvml is not None:
                 collectors.append(nvml)
+            amd = AmdGpuSysfsCollector.try_create()
+            if amd is not None:
+                collectors.append(amd)
     elif system == "darwin":
         macos = MacOSThermalStateCollector.try_create()
         if macos is not None:

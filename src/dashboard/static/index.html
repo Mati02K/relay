@@ -6,14 +6,36 @@
     <title>Relay // Dashboard</title>
     <link rel="stylesheet" href="/assets/styles.css" />
   </head>
-  <body>
+  <body data-view="map">
     <header class="topbar">
-      <div class="brand">
+      <button class="brand" id="brand-btn" type="button" title="Home — cluster map">
         <span class="brand-mark">◢</span>
         <span class="brand-name">Relay</span>
         <span class="env-tag">local · dashboard</span>
+      </button>
+
+      <div class="header-spacer"></div>
+
+      <button id="test-btn" class="nav-btn nav-test" type="button">
+        <span class="test-dot"></span>
+        <span>test</span>
+      </button>
+
+      <button id="settings-btn" class="nav-btn nav-settings" type="button">
+        <span class="nav-icon">⚙</span>
+        <span>settings</span>
+      </button>
+
+      <div class="connection">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span id="conn-status">connecting…</span>
+        <span class="coordinator-url" id="coordinator-url">—</span>
       </div>
-      <div class="stats">
+    </header>
+
+    <!-- ============================ MAP VIEW ============================ -->
+    <main class="view view-map" id="view-map">
+      <div class="map-stats">
         <div class="stat">
           <span class="stat-label">workers</span>
           <span class="stat-value" id="stat-workers">—</span>
@@ -23,82 +45,129 @@
           <span class="stat-value" id="stat-healthy">—</span>
         </div>
         <div class="stat">
-          <span class="stat-label">avg q_w</span>
-          <span class="stat-value" id="stat-qw">—</span>
+          <span class="stat-label">avg thermal</span>
+          <span class="stat-value" id="stat-thermal">—</span>
         </div>
         <div class="stat">
-          <span class="stat-label">avg m_w</span>
-          <span class="stat-value" id="stat-mw">—</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">throttled</span>
-          <span class="stat-value" id="stat-throttled">—</span>
+          <span class="stat-label">avg jitter</span>
+          <span class="stat-value" id="stat-jitter">—</span>
         </div>
       </div>
-      <div class="connection">
-        <span class="conn-dot" id="conn-dot"></span>
-        <span id="conn-status">connecting…</span>
-        <span class="coordinator-url" id="coordinator-url">—</span>
+
+      <div class="map-canvas" id="map-canvas">
+        <svg id="map-svg" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+          <!-- nodes + edges rendered by app.js -->
+        </svg>
+        <div class="map-empty" id="map-empty">
+          <div class="empty-title">No workers yet</div>
+          <div class="empty-sub">Start a worker — <code>relay start</code> — and it'll appear here.</div>
+        </div>
       </div>
-    </header>
 
-    <main class="layout">
-      <aside class="panel workers">
-        <div class="panel-header">
-          <span class="panel-title">Workers</span>
-          <span class="panel-count" id="worker-count">0</span>
-        </div>
-        <div class="worker-list" id="worker-list">
-          <div class="empty">No workers registered.</div>
-        </div>
-      </aside>
-
-      <section class="chat">
-        <div class="chat-header">
-          <span class="chat-title">Chat</span>
-          <div class="chat-controls">
-            <label class="control-label" for="model-select">model</label>
-            <select id="model-select" class="model-select"></select>
-            <button id="clear-btn" class="ghost-btn" type="button">clear</button>
-          </div>
-        </div>
-        <div class="messages" id="messages">
-          <div class="empty messages-empty">
-            <div class="empty-title">Nothing here yet.</div>
-            <div class="empty-sub">Send a message to route a request through the coordinator.</div>
-          </div>
-        </div>
-        <div class="composer">
-          <textarea
-            id="prompt"
-            class="prompt"
-            rows="3"
-            placeholder="Type a message. ⌘/Ctrl+Enter to send."
-          ></textarea>
-          <div class="composer-row">
-            <span class="composer-hint" id="composer-hint">Idle</span>
-            <button id="cancel-btn" class="cancel-btn" type="button" disabled>cancel</button>
-            <button id="send-btn" class="send-btn" type="button">send</button>
-          </div>
-        </div>
-      </section>
-
-      <aside class="panel detail">
-        <div class="panel-header">
-          <span class="panel-title">Last decision</span>
-          <span class="panel-count" id="detail-cost">—</span>
-        </div>
-        <div class="detail-body" id="detail-body">
-          <div class="empty">No request yet.</div>
-        </div>
-      </aside>
+      <div class="map-legend">
+        <div class="legend-item"><span class="legend-dot healthy"></span> healthy</div>
+        <div class="legend-item"><span class="legend-dot warn"></span> warming</div>
+        <div class="legend-item"><span class="legend-dot danger"></span> throttling / unreachable</div>
+        <div class="legend-hint">click a worker node for details</div>
+      </div>
     </main>
+
+    <!-- ============================ CHAT VIEW ============================ -->
+    <main class="view view-chat" id="view-chat" hidden>
+      <div class="view-page-header">
+        <span class="view-page-title">Test Chat</span>
+        <div class="chat-controls">
+          <label class="control-label" for="model-select">model</label>
+          <select id="model-select" class="model-select"></select>
+          <button id="clear-btn" class="ghost-btn" type="button">clear</button>
+        </div>
+      </div>
+
+      <div class="chat-body">
+        <section class="chat">
+          <div class="messages" id="messages">
+            <div class="empty messages-empty">
+              <div class="empty-title">Nothing here yet.</div>
+              <div class="empty-sub">Send a message to route a request through the coordinator.</div>
+            </div>
+          </div>
+          <div class="composer">
+            <textarea
+              id="prompt"
+              class="prompt"
+              rows="3"
+              placeholder="Type a message. ⌘/Ctrl+Enter to send."
+            ></textarea>
+            <div class="composer-row">
+              <span class="composer-hint" id="composer-hint">Idle</span>
+              <button id="cancel-btn" class="cancel-btn" type="button" disabled>cancel</button>
+              <button id="send-btn" class="send-btn" type="button">send</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel detail">
+          <div class="panel-header">
+            <span class="panel-title">Last decision</span>
+            <span class="panel-count" id="detail-cost">—</span>
+          </div>
+          <div class="detail-body" id="detail-body">
+            <div class="empty">No request yet.</div>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <!-- ========================== SETTINGS VIEW ========================== -->
+    <main class="view view-settings" id="view-settings" hidden>
+      <div class="view-page-header">
+        <span class="view-page-title">Settings</span>
+      </div>
+
+      <div class="settings-body">
+        <div class="settings-shell">
+          <header class="settings-head">
+            <div>
+              <div class="settings-title">Scheduler weights</div>
+              <div class="settings-sub">
+                Live. Apply updates the running coordinator with no restart.
+                Each weight is <code>[0.0, 1.0]</code> — 1.0 is full influence, 0 disables the signal.
+              </div>
+            </div>
+            <div class="settings-actions">
+              <button id="reset-btn" class="ghost-btn" type="button">Reset</button>
+              <button id="apply-btn" class="send-btn" type="button" disabled>Apply</button>
+            </div>
+          </header>
+
+          <div class="weights-grid" id="weights-grid">
+            <!-- five sliders rendered by app.js -->
+          </div>
+
+          <footer class="settings-foot">
+            <div id="apply-status" class="apply-status"></div>
+          </footer>
+        </div>
+      </div>
+    </main>
+
+    <!-- ========================== WORKER DETAIL ========================== -->
+    <aside class="worker-drawer" id="worker-drawer" hidden>
+      <div class="drawer-head">
+        <div class="drawer-titles">
+          <div class="drawer-title" id="drawer-title">—</div>
+          <div class="drawer-sub" id="drawer-sub">—</div>
+        </div>
+        <button class="ghost-btn" id="drawer-close" type="button">close</button>
+      </div>
+      <div class="drawer-body" id="drawer-body"></div>
+    </aside>
 
     <footer class="bottombar">
       <span class="footer-cell">relay dashboard</span>
       <span class="footer-cell" id="dashboard-version">v0.1</span>
       <span class="footer-cell" id="footer-coordinator">—</span>
-      <span class="footer-cell muted">⌘/Ctrl+Enter to send</span>
+      <span class="footer-cell muted" id="footer-hint" hidden>⌘/Ctrl+Enter to send</span>
     </footer>
 
     <script src="/assets/app.js"></script>

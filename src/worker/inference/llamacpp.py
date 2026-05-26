@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
+import subprocess
 import time
 from collections.abc import AsyncIterator, Mapping
 
@@ -94,6 +96,31 @@ class LlamaCppEngine(InferenceEngine):
             if not shutil.which(self._binary):
                 raise RuntimeError(f"llama-server binary not found in PATH: {self._binary}")
 
+            if await _port_reachable(self._host, self._port):
+                adopted = await self._try_adopt()
+                if adopted:
+                    return
+                # Port is occupied but unresponsive — kill whatever is there.
+                killed = await asyncio.get_event_loop().run_in_executor(
+                    None, _kill_pids_on_port, self._port
+                )
+                if killed:
+                    logger.info(
+                        "Killed stale process(es) on port {} before starting llama-server | pids={}",
+                        self._port,
+                        killed,
+                    )
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        if not await _port_reachable(self._host, self._port):
+                            break
+                        await asyncio.sleep(0.2)
+                else:
+                    raise RuntimeError(
+                        f"Port {self._port} is already in use and could not be cleared. "
+                        "Free the port manually and retry."
+                    )
+
             args: list[str] = [
                 self._binary,
                 "-m",
@@ -157,6 +184,28 @@ class LlamaCppEngine(InferenceEngine):
             except TimeoutError:
                 self._proc.kill()
         self._proc = None
+
+    async def _try_adopt(self) -> bool:
+        """Adopt an already-running llama-server on our port without spawning.
+
+        Returns True and sets ``self._http`` when the server is healthy.
+        Returns False and closes the client when it is not responding.
+        """
+        client = httpx.AsyncClient(base_url=self.base_url, timeout=httpx.Timeout(2.0))
+        try:
+            r = await client.get("/health")
+            if r.status_code == 200:
+                self._http = client
+                logger.info(
+                    "Adopted existing llama-server on port {} | url={}",
+                    self._port,
+                    self.base_url,
+                )
+                return True
+        except httpx.RequestError:
+            pass
+        await client.aclose()
+        return False
 
     async def _drain_stderr_tail(self, max_bytes: int = 4000) -> str:
         if not self._proc or not self._proc.stderr:
@@ -236,3 +285,60 @@ def _split_args(raw: str) -> list[str]:
     if not raw:
         return []
     return raw.split()
+
+
+async def _port_reachable(host: str, port: int) -> bool:
+    """Return True if something is already listening on host:port."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=0.5,
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
+def _kill_pids_on_port(port: int) -> list[int]:
+    """Return PIDs found listening on port and send them SIGTERM.
+
+    Tries ``fuser`` first (common on Linux), then ``lsof`` (macOS / Linux).
+    Returns the list of PIDs that were signalled.
+    """
+    pids: list[int] = []
+
+    try:
+        r = subprocess.run(
+            ["fuser", f"{port}/tcp"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        pids = [int(p) for p in r.stdout.split() if p.strip().lstrip("-").isdigit()]
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+    if not pids:
+        try:
+            r = subprocess.run(
+                ["lsof", "-ti", f"TCP:{port}", "-s", "TCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            pids = [int(p) for p in r.stdout.splitlines() if p.strip().isdigit()]
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    return pids

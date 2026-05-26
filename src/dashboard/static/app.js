@@ -1,60 +1,131 @@
-// Relay dashboard front-end. Polls /api/workers for telemetry and streams
-// chat completions through /api/chat/completions.
+// Relay dashboard front-end.
+//
+// Three views switchable from the top bar:
+//   - map      hub-and-spoke SVG topology of coordinator + workers
+//   - chat     test chat UI (streams through the coordinator)
+//   - settings live scheduler weight tuning (5 sliders + Apply)
+//
+// State is global because the dashboard is small; switching views is just
+// hiding/showing top-level <main> elements. The map view polls /api/workers
+// every WORKER_POLL_INTERVAL_MS; the chat view does its own bookkeeping;
+// the settings view only fetches when first opened.
 
 const WORKER_POLL_INTERVAL_MS = 3000;
 
 const state = {
+  view: "map",
   conversation: [],
   workers: [],
   selectedModel: null,
   abortController: null,
+  weights: null,
+  weightsBaseline: null,
+  weightsDirty: false,
+  drawerWorkerId: null,
 };
 
-const el = {
-  workers: document.getElementById("worker-list"),
-  workerCount: document.getElementById("worker-count"),
-  messages: document.getElementById("messages"),
-  prompt: document.getElementById("prompt"),
-  send: document.getElementById("send-btn"),
-  cancel: document.getElementById("cancel-btn"),
-  clear: document.getElementById("clear-btn"),
-  modelSelect: document.getElementById("model-select"),
-  composerHint: document.getElementById("composer-hint"),
-  detailBody: document.getElementById("detail-body"),
-  detailCost: document.getElementById("detail-cost"),
-  statWorkers: document.getElementById("stat-workers"),
-  statHealthy: document.getElementById("stat-healthy"),
-  statQw: document.getElementById("stat-qw"),
-  statMw: document.getElementById("stat-mw"),
-  statThrottled: document.getElementById("stat-throttled"),
-  connDot: document.getElementById("conn-dot"),
-  connStatus: document.getElementById("conn-status"),
-  coordinatorUrl: document.getElementById("coordinator-url"),
-  footerCoordinator: document.getElementById("footer-coordinator"),
-};
+const el = {};
 
 document.addEventListener("DOMContentLoaded", () => {
-  init();
+  cacheElements();
+  wireGlobalControls();
+  wireChat();
+  wireSettings();
+  wireDrawer();
+  loadConfig();
+  refreshWorkers();
+  setInterval(refreshWorkers, WORKER_POLL_INTERVAL_MS);
 });
 
-async function init() {
-  el.send.addEventListener("click", onSend);
-  el.cancel.addEventListener("click", onCancel);
-  el.clear.addEventListener("click", clearConversation);
-  el.modelSelect.addEventListener("change", () => {
-    state.selectedModel = el.modelSelect.value;
-  });
-  el.prompt.addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      onSend();
+function cacheElements() {
+  el.body = document.body;
+  el.views = {
+    map: document.getElementById("view-map"),
+    chat: document.getElementById("view-chat"),
+    settings: document.getElementById("view-settings"),
+  };
+  el.brandBtn = document.getElementById("brand-btn");
+  el.testBtn = document.getElementById("test-btn");
+  el.settingsBtn = document.getElementById("settings-btn");
+  el.connDot = document.getElementById("conn-dot");
+  el.connStatus = document.getElementById("conn-status");
+  el.coordinatorUrl = document.getElementById("coordinator-url");
+  el.footerCoordinator = document.getElementById("footer-coordinator");
+  el.footerHint = document.getElementById("footer-hint");
+
+  // Map view
+  el.mapSvg = document.getElementById("map-svg");
+  el.mapCanvas = document.getElementById("map-canvas");
+  el.mapEmpty = document.getElementById("map-empty");
+  el.statWorkers = document.getElementById("stat-workers");
+  el.statHealthy = document.getElementById("stat-healthy");
+  el.statThermal = document.getElementById("stat-thermal");
+  el.statJitter = document.getElementById("stat-jitter");
+
+  // Chat view
+  el.messages = document.getElementById("messages");
+  el.prompt = document.getElementById("prompt");
+  el.send = document.getElementById("send-btn");
+  el.cancel = document.getElementById("cancel-btn");
+  el.clear = document.getElementById("clear-btn");
+  el.modelSelect = document.getElementById("model-select");
+  el.composerHint = document.getElementById("composer-hint");
+  el.detailBody = document.getElementById("detail-body");
+  el.detailCost = document.getElementById("detail-cost");
+
+  // Settings view
+  el.weightsGrid = document.getElementById("weights-grid");
+  el.applyBtn = document.getElementById("apply-btn");
+  el.resetBtn = document.getElementById("reset-btn");
+  el.applyStatus = document.getElementById("apply-status");
+
+  // Drawer
+  el.drawer = document.getElementById("worker-drawer");
+  el.drawerTitle = document.getElementById("drawer-title");
+  el.drawerSub = document.getElementById("drawer-sub");
+  el.drawerBody = document.getElementById("drawer-body");
+  el.drawerClose = document.getElementById("drawer-close");
+}
+
+// ============================ View switching ============================
+
+function wireGlobalControls() {
+  el.brandBtn.addEventListener("click", () => switchView("map"));
+  el.testBtn.addEventListener("click", () => switchView("chat"));
+  el.settingsBtn.addEventListener("click", () => switchView("settings"));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (!el.drawer.hidden) {
+        closeDrawer();
+      } else if (state.view !== "map") {
+        switchView("map");
+      }
     }
   });
-
-  await loadConfig();
-  await refreshWorkers();
-  setInterval(refreshWorkers, WORKER_POLL_INTERVAL_MS);
 }
+
+function switchView(name) {
+  if (!(name in el.views)) return;
+  state.view = name;
+  el.body.dataset.view = name;
+  for (const [key, node] of Object.entries(el.views)) {
+    node.hidden = key !== name;
+  }
+  // Highlight the active nav button.
+  el.testBtn.classList.toggle("active", name === "chat");
+  el.settingsBtn.classList.toggle("active", name === "settings");
+  // Footer hint is only relevant in the chat view.
+  el.footerHint.hidden = name !== "chat";
+  if (name === "settings" && state.weights === null) {
+    fetchWeights();
+  }
+  if (name === "map") {
+    // Re-render the map so layout fills the now-visible canvas.
+    renderMap();
+  }
+}
+
+// ============================ Config / connection ============================
 
 async function loadConfig() {
   try {
@@ -67,6 +138,13 @@ async function loadConfig() {
   }
 }
 
+function setConnection(level, label) {
+  el.connDot.className = `conn-dot ${level}`;
+  el.connStatus.textContent = label;
+}
+
+// ============================ Worker polling + stats ============================
+
 async function refreshWorkers() {
   try {
     const res = await fetch("/api/workers");
@@ -74,143 +152,445 @@ async function refreshWorkers() {
       setConnection("danger", `coordinator ${res.status}`);
       return;
     }
-    const workers = await res.json();
-    state.workers = workers;
-    renderWorkers();
-    updateModelSelect();
-    updateStats();
+    state.workers = await res.json();
     setConnection("healthy", "connected");
+    updateStats();
+    updateModelSelect();
+    renderMap();
+    refreshDrawerIfOpen();
   } catch (e) {
     setConnection("danger", "unreachable");
   }
 }
 
-function setConnection(level, label) {
-  el.connDot.className = `conn-dot ${level}`;
-  el.connStatus.textContent = label;
-}
-
 function updateStats() {
   const workers = state.workers;
   el.statWorkers.textContent = workers.length || "0";
-  const healthy = workers.filter((w) => isWorkerHealthy(w)).length;
+  const healthy = workers.filter(workerInferenceReady).length;
   el.statHealthy.textContent = `${healthy}/${workers.length || 0}`;
   if (workers.length === 0) {
-    el.statQw.textContent = "—";
-    el.statMw.textContent = "—";
-    el.statThrottled.textContent = "—";
+    el.statThermal.textContent = "—";
+    el.statJitter.textContent = "—";
     return;
   }
-  const avgQw =
-    workers.reduce((sum, w) => sum + (w.telemetry?.qw || 0), 0) / workers.length;
-  const avgMw =
-    workers.reduce((sum, w) => sum + (w.telemetry?.mw || 0), 0) / workers.length;
-  const throttled = workers.filter((w) => (w.telemetry?.theta_w || 0) > 0).length;
-  el.statQw.textContent = avgQw.toFixed(2);
-  el.statMw.textContent = `${(avgMw * 100).toFixed(0)}%`;
-  el.statThrottled.textContent = `${throttled}/${workers.length}`;
+  const thermals = workers.map((w) => Number(w.telemetry?.theta_w || 0));
+  const jitters = workers.map((w) => Number(w.telemetry?.jw || 0));
+  el.statThermal.textContent = avg(thermals).toFixed(2);
+  el.statJitter.textContent = `${avg(jitters).toFixed(1)}ms`;
 }
 
-function isWorkerHealthy(worker) {
-  if (!isInferenceReady(worker)) return false;
-  const tele = worker.telemetry || {};
-  if ((tele.theta_w || 0) > 0) return false;
-  if ((tele.mw || 0) > 0.95) return false;
-  return true;
+function avg(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
-function isInferenceReady(worker) {
-  if (worker.healthy === false) return false;
-  const engine = worker.health?.engine || worker.health?.body?.engine || worker.engine;
-  if (!engine) return worker.healthy === true;
-  return engine.status === true;
-}
-
-function renderWorkers() {
-  el.workerCount.textContent = String(state.workers.length);
-  if (state.workers.length === 0) {
-    el.workers.innerHTML =
-      '<div class="empty">No workers registered. Start a worker with <code>relay start</code>.</div>';
-    return;
-  }
-  el.workers.innerHTML = "";
-  for (const worker of state.workers) {
-    el.workers.appendChild(renderWorkerCard(worker));
-  }
-}
-
-function renderWorkerCard(worker) {
-  const tele = worker.telemetry || {};
-  const card = document.createElement("div");
-  card.className = "worker-card";
-
-  const inferenceReady = isInferenceReady(worker);
-  const stateLevel = !inferenceReady
-    ? "danger"
-    : (tele.theta_w || 0) > 0
-    ? "danger"
-    : (tele.mw || 0) > 0.85
-    ? "warn"
-    : "healthy";
-  const stateLabel = !inferenceReady ? "unhealthy" : stateLevel;
-
-  const head = document.createElement("div");
-  head.className = "worker-card-head";
-  head.innerHTML = `
-    <span class="worker-id">${escapeHtml(worker.node_id)}</span>
-    <span class="worker-state ${stateLevel}">${stateLabel}</span>
-  `;
-  card.appendChild(head);
-
-  const meta = document.createElement("div");
-  meta.className = "worker-meta";
-  meta.textContent = worker.address || "(no address)";
-  card.appendChild(meta);
-
-  if (!inferenceReady) {
-    const detail = document.createElement("div");
-    detail.className = "worker-health-detail";
-    detail.textContent = healthDetail(worker);
-    card.appendChild(detail);
-  }
-
-  const bars = document.createElement("div");
-  bars.className = "worker-bars";
-  bars.appendChild(makeBar("q_w", tele.qw || 0, 8));
-  bars.appendChild(makeBar("m_w", (tele.mw || 0) * 100, 100, "%"));
-  bars.appendChild(makeBar("j_w", tele.jw || 0, 50, "ms"));
-  bars.appendChild(makeBar("θ_w", tele.theta_w || 0, 1));
-  card.appendChild(bars);
-
-  return card;
-}
-
-function healthDetail(worker) {
+function workerInferenceReady(worker) {
   const engine = worker.health?.engine || worker.health?.body?.engine || {};
-  return engine.detail || worker.health?.detail || "inference engine unavailable";
+  if (engine.status === false) return false;
+  return worker.healthy !== false;
 }
 
-function makeBar(label, value, max, suffix = "") {
-  const ratio = Math.max(0, Math.min(1, max > 0 ? value / max : 0));
-  const fillClass = ratio > 0.9 ? "danger" : ratio > 0.7 ? "warn" : "";
-  const displayValue =
-    suffix === "%"
-      ? `${value.toFixed(0)}%`
-      : suffix === "ms"
-      ? `${value.toFixed(1)}ms`
-      : Number.isInteger(value)
-      ? `${value}`
-      : value.toFixed(2);
-  const node = document.createElement("div");
-  node.className = "bar";
-  node.innerHTML = `
-    <div class="bar-label">
-      <span>${label}</span>
-      <span class="value">${displayValue}</span>
-    </div>
-    <div class="bar-track"><div class="bar-fill ${fillClass}" style="width:${ratio * 100}%"></div></div>
+function workerState(worker) {
+  if (!workerInferenceReady(worker)) return "danger";
+  const tele = worker.telemetry || {};
+  const thermal = Number(tele.thermal?.pressure ?? tele.theta_w ?? 0);
+  if (thermal >= 0.65) return "danger";
+  if (thermal >= 0.35) return "warn";
+  const mw = Number(tele.mw || 0);
+  if (mw >= 0.85) return "warn";
+  return "healthy";
+}
+
+// ============================ Map view ============================
+
+function renderMap() {
+  const svg = el.mapSvg;
+  const canvas = el.mapCanvas;
+  // Make SVG fill the canvas; recompute every render so resizes work.
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(400, rect.width);
+  const h = Math.max(280, rect.height);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+
+  const workers = state.workers;
+  // Use style.display directly — the CSS `display: flex` on .map-empty would
+  // override the [hidden] attribute's implicit `display: none` otherwise.
+  el.mapEmpty.style.display = workers.length > 0 ? "none" : "flex";
+
+  // Hub-and-spoke layout: coordinator at center, workers around the rim.
+  const cx = w / 2;
+  const cy = h / 2;
+  const ringRadius = Math.min(w, h) * 0.36;
+
+  const edges = [];
+  const workerNodes = [];
+  workers.forEach((worker, index) => {
+    const angle = workers.length === 1
+      ? -Math.PI / 2
+      : (index / workers.length) * Math.PI * 2 - Math.PI / 2;
+    const x = cx + Math.cos(angle) * ringRadius;
+    const y = cy + Math.sin(angle) * ringRadius;
+    edges.push({ x1: cx, y1: cy, x2: x, y2: y, level: workerState(worker) });
+    workerNodes.push({ worker, x, y, level: workerState(worker) });
+  });
+
+  svg.innerHTML = "";
+  svg.appendChild(svgDefs());
+
+  // edges first so they sit behind nodes
+  for (const edge of edges) {
+    svg.appendChild(svgEdge(edge));
+  }
+
+  // coordinator hub
+  svg.appendChild(svgCoordinator(cx, cy));
+
+  // workers
+  for (const node of workerNodes) {
+    svg.appendChild(svgWorker(node));
+  }
+}
+
+function svgDefs() {
+  const defs = svgEl("defs");
+  defs.innerHTML = `
+    <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="rgba(245,176,33,0.65)"/>
+      <stop offset="55%" stop-color="rgba(245,176,33,0.18)"/>
+      <stop offset="100%" stop-color="rgba(245,176,33,0)"/>
+    </radialGradient>
+    <radialGradient id="workerGlowHealthy" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="rgba(74,222,128,0.55)"/>
+      <stop offset="100%" stop-color="rgba(74,222,128,0)"/>
+    </radialGradient>
+    <radialGradient id="workerGlowWarn" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="rgba(251,191,36,0.55)"/>
+      <stop offset="100%" stop-color="rgba(251,191,36,0)"/>
+    </radialGradient>
+    <radialGradient id="workerGlowDanger" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="rgba(239,68,68,0.55)"/>
+      <stop offset="100%" stop-color="rgba(239,68,68,0)"/>
+    </radialGradient>
   `;
+  return defs;
+}
+
+function svgEl(tag, attrs = {}) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
   return node;
+}
+
+function svgEdge({ x1, y1, x2, y2, level }) {
+  const group = svgEl("g", { class: `map-edge level-${level}` });
+  group.appendChild(svgEl("line", {
+    x1, y1, x2, y2,
+    "stroke-linecap": "round",
+  }));
+  // Animated pulse dot travelling from worker to coordinator.
+  const pulse = svgEl("circle", { r: 2.5, class: "map-pulse" });
+  const dx = x1 - x2;
+  const dy = y1 - y2;
+  const len = Math.hypot(dx, dy);
+  const period = Math.max(1.6, len / 220);
+  const animateX = svgEl("animate", {
+    attributeName: "cx",
+    from: x2, to: x1,
+    dur: `${period}s`,
+    repeatCount: "indefinite",
+  });
+  const animateY = svgEl("animate", {
+    attributeName: "cy",
+    from: y2, to: y1,
+    dur: `${period}s`,
+    repeatCount: "indefinite",
+  });
+  pulse.appendChild(animateX);
+  pulse.appendChild(animateY);
+  group.appendChild(pulse);
+  return group;
+}
+
+function svgCoordinator(cx, cy) {
+  const group = svgEl("g", { class: "map-node coordinator-node", role: "button", tabindex: "0" });
+  group.setAttribute("aria-label", "Coordinator — click to open settings");
+  group.appendChild(svgEl("circle", { cx, cy, r: 64, fill: "url(#hubGlow)" }));
+  group.appendChild(svgEl("circle", { cx, cy, r: 36, class: "coord-disc" }));
+  const label = svgEl("text", {
+    x: cx, y: cy + 4,
+    "text-anchor": "middle",
+    class: "coord-label",
+  });
+  label.textContent = "COORD";
+  group.appendChild(label);
+  const sub = svgEl("text", {
+    x: cx, y: cy + 60,
+    "text-anchor": "middle",
+    class: "coord-sub",
+  });
+  sub.textContent = "click → settings";
+  group.appendChild(sub);
+  group.addEventListener("click", () => switchView("settings"));
+  group.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      switchView("settings");
+    }
+  });
+  return group;
+}
+
+function svgWorker(node) {
+  const { worker, x, y, level } = node;
+  const group = svgEl("g", { class: `map-node worker-node level-${level}`, role: "button", tabindex: "0" });
+  group.setAttribute("aria-label", `Worker ${worker.node_id} — click for details`);
+  group.appendChild(svgEl("circle", { cx: x, cy: y, r: 38, fill: `url(#workerGlow${cap(level)})` }));
+  group.appendChild(svgEl("circle", { cx: x, cy: y, r: 22, class: "worker-disc" }));
+  const label = svgEl("text", {
+    x, y: y + 4,
+    "text-anchor": "middle",
+    class: "worker-letter",
+  });
+  label.textContent = (worker.node_id || "?").charAt(0).toUpperCase();
+  group.appendChild(label);
+  const idText = svgEl("text", {
+    x, y: y + 42,
+    "text-anchor": "middle",
+    class: "worker-id",
+  });
+  idText.textContent = worker.node_id;
+  group.appendChild(idText);
+  group.addEventListener("click", () => openDrawer(worker.node_id));
+  group.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      openDrawer(worker.node_id);
+    }
+  });
+  return group;
+}
+
+function cap(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// ============================ Worker detail drawer ============================
+
+function wireDrawer() {
+  el.drawerClose.addEventListener("click", closeDrawer);
+}
+
+function openDrawer(nodeId) {
+  state.drawerWorkerId = nodeId;
+  refreshDrawerIfOpen();
+  el.drawer.hidden = false;
+  requestAnimationFrame(() => el.drawer.classList.add("open"));
+}
+
+function closeDrawer() {
+  state.drawerWorkerId = null;
+  el.drawer.classList.remove("open");
+  setTimeout(() => { el.drawer.hidden = true; }, 220);
+}
+
+function refreshDrawerIfOpen() {
+  if (!state.drawerWorkerId) return;
+  const worker = state.workers.find((w) => w.node_id === state.drawerWorkerId);
+  if (!worker) {
+    el.drawerTitle.textContent = state.drawerWorkerId;
+    el.drawerSub.textContent = "Worker no longer registered.";
+    el.drawerBody.innerHTML = '<div class="empty">This worker has left the cluster.</div>';
+    return;
+  }
+  const tele = worker.telemetry || {};
+  const thermal = tele.thermal || {};
+  const models = (worker.models || []).map((m) => m.id || m.filename || "?").join(", ") || "—";
+  const engine = worker.health?.engine?.engine || worker.health?.body?.engine?.engine || "—";
+  const engineDetail = worker.health?.engine?.detail || worker.health?.body?.engine?.detail || "—";
+  const level = workerState(worker);
+
+  el.drawerTitle.textContent = worker.node_id;
+  el.drawerSub.textContent = worker.address || "—";
+  el.drawerBody.innerHTML = `
+    <div class="drawer-section">
+      <div class="drawer-section-title">Health</div>
+      <dl class="drawer-kv">
+        <dt>state</dt><dd class="state-${level}">${level}</dd>
+        <dt>engine</dt><dd>${escapeHtml(engine)} (${escapeHtml(engineDetail)})</dd>
+        <dt>http</dt><dd>${escapeHtml(String(worker.health?.status_code ?? "—"))}</dd>
+      </dl>
+    </div>
+    <div class="drawer-section">
+      <div class="drawer-section-title">Telemetry</div>
+      <dl class="drawer-kv">
+        <dt>queue (q_w)</dt><dd>${Number(tele.qw ?? 0).toFixed(0)}</dd>
+        <dt>memory (m_w)</dt><dd>${(Number(tele.mw ?? 0) * 100).toFixed(0)}%</dd>
+        <dt>jitter (j_w)</dt><dd>${Number(tele.jw ?? 0).toFixed(1)} ms</dd>
+        <dt>thermal (θ_w)</dt><dd>${Number(tele.theta_w ?? 0).toFixed(2)}</dd>
+        <dt>thermal state</dt><dd class="state-${level}">${escapeHtml(thermal.state || "—")}</dd>
+        <dt>cpu pressure</dt><dd>${Number(thermal.cpu_pressure ?? 0).toFixed(2)}</dd>
+        <dt>gpu pressure</dt><dd>${Number(thermal.gpu_pressure ?? 0).toFixed(2)}</dd>
+      </dl>
+    </div>
+    <div class="drawer-section">
+      <div class="drawer-section-title">Models</div>
+      <div class="drawer-models">${escapeHtml(models)}</div>
+    </div>
+  `;
+}
+
+// ============================ Settings view ============================
+
+const WEIGHT_FIELDS = [
+  {
+    key: "queue",
+    label: "queue (q_w / decode speed)",
+    hint: "Avoids workers with a growing backlog of requests. Raise this if you want the scheduler to actively spread load away from busy workers.",
+  },
+  {
+    key: "prefix_miss",
+    label: "prefix_miss (1 − overlap)",
+    hint: "Prefers workers that already have your conversation cached. Raise this to maximise KV-cache reuse — useful for long, repetitive prompts.",
+  },
+  {
+    key: "memory",
+    label: "memory (m_w)",
+    hint: "Avoids workers running low on GPU/CPU memory. Raise this if workers are frequently hitting out-of-memory errors.",
+  },
+  {
+    key: "jitter",
+    label: "jitter (j_w / j_max)",
+    hint: "Avoids workers on unstable or high-latency network paths. Raise this on multi-machine clusters where link quality varies.",
+  },
+  {
+    key: "thermal",
+    label: "thermal (θ_w)",
+    hint: "Avoids workers that are overheating or CPU/GPU throttling. Set to 0 to ignore temperature entirely (useful in a controlled environment).",
+  },
+];
+
+function wireSettings() {
+  el.applyBtn.addEventListener("click", applyWeights);
+  el.resetBtn.addEventListener("click", () => {
+    if (state.weightsBaseline) {
+      state.weights = { ...state.weightsBaseline };
+      renderWeights();
+      markWeightsDirty(false);
+    }
+  });
+}
+
+async function fetchWeights() {
+  setApplyStatus("loading…", "neutral");
+  try {
+    const res = await fetch("/api/scheduler/weights");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const weights = await res.json();
+    state.weights = weights;
+    state.weightsBaseline = { ...weights };
+    renderWeights();
+    markWeightsDirty(false);
+    setApplyStatus("", "neutral");
+  } catch (e) {
+    setApplyStatus(`Failed to load weights: ${e.message || e}`, "error");
+  }
+}
+
+function renderWeights() {
+  if (!state.weights) {
+    el.weightsGrid.innerHTML = '<div class="empty">Loading scheduler weights…</div>';
+    return;
+  }
+  el.weightsGrid.innerHTML = "";
+  for (const field of WEIGHT_FIELDS) {
+    const value = state.weights[field.key] ?? 1.0;
+    const card = document.createElement("div");
+    card.className = "weight-card";
+    card.innerHTML = `
+      <div class="weight-head">
+        <span class="weight-label">${escapeHtml(field.label)}</span>
+        <span class="weight-value" data-bind="${field.key}-num">${value.toFixed(2)}</span>
+      </div>
+      <input type="range" min="0" max="1" step="0.01" value="${value}" data-bind="${field.key}-range" />
+      <div class="weight-hint">${escapeHtml(field.hint)}</div>
+    `;
+    el.weightsGrid.appendChild(card);
+    const range = card.querySelector(`input[data-bind='${field.key}-range']`);
+    const numEl = card.querySelector(`[data-bind='${field.key}-num']`);
+    range.addEventListener("input", () => {
+      const v = clamp01(parseFloat(range.value));
+      state.weights[field.key] = v;
+      numEl.textContent = v.toFixed(2);
+      markWeightsDirty(detectDirty());
+    });
+  }
+}
+
+function detectDirty() {
+  if (!state.weights || !state.weightsBaseline) return false;
+  return WEIGHT_FIELDS.some(
+    (f) => (state.weights[f.key] ?? 0) !== (state.weightsBaseline[f.key] ?? 0),
+  );
+}
+
+function markWeightsDirty(dirty) {
+  state.weightsDirty = dirty;
+  el.applyBtn.disabled = !dirty;
+}
+
+async function applyWeights() {
+  if (!state.weightsDirty) return;
+  setApplyStatus("applying…", "neutral");
+  el.applyBtn.disabled = true;
+  try {
+    const res = await fetch("/api/scheduler/weights", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.weights),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text.slice(0, 200) || `HTTP ${res.status}`);
+    }
+    const applied = await res.json();
+    state.weights = applied;
+    state.weightsBaseline = { ...applied };
+    renderWeights();
+    markWeightsDirty(false);
+    setApplyStatus("applied. Scheduler now using new weights.", "success");
+  } catch (e) {
+    setApplyStatus(`Apply failed: ${e.message || e}`, "error");
+    markWeightsDirty(true);
+  }
+}
+
+function setApplyStatus(text, level) {
+  el.applyStatus.textContent = text;
+  el.applyStatus.className = `apply-status apply-${level}`;
+}
+
+function clamp01(v) {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(1, v));
+}
+
+// ============================ Chat view ============================
+
+function wireChat() {
+  el.send.addEventListener("click", onSend);
+  el.cancel.addEventListener("click", onCancel);
+  el.clear.addEventListener("click", clearConversation);
+  el.modelSelect.addEventListener("change", () => {
+    state.selectedModel = el.modelSelect.value;
+  });
+  el.prompt.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      onSend();
+    }
+  });
 }
 
 function updateModelSelect() {
@@ -222,21 +602,16 @@ function updateModelSelect() {
   }
   const previous = el.modelSelect.value || state.selectedModel;
   el.modelSelect.innerHTML = "";
-
-  // "auto" — coordinator's scheduler picks the worker regardless of model id.
   const autoOption = document.createElement("option");
   autoOption.value = "auto";
   autoOption.textContent = "auto (coordinator picks)";
   el.modelSelect.appendChild(autoOption);
-
   for (const id of models) {
     const option = document.createElement("option");
     option.value = id;
     option.textContent = id;
     el.modelSelect.appendChild(option);
   }
-
-  // Restore prior choice if it's still valid, else default to auto.
   if (previous && (previous === "auto" || models.has(previous))) {
     el.modelSelect.value = previous;
   } else {
@@ -273,11 +648,8 @@ async function onSend() {
   toggleSending(true);
   el.composerHint.textContent = "streaming…";
 
-  // Omit the model field when "auto" so the scheduler picks across all workers.
   const requestBody = { messages: state.conversation, stream: true };
-  if (model && model !== "auto") {
-    requestBody.model = model;
-  }
+  if (model && model !== "auto") requestBody.model = model;
 
   try {
     const { content: assistantText, headers } = await streamCompletion(
@@ -309,9 +681,7 @@ async function onSend() {
 }
 
 function onCancel() {
-  if (state.abortController) {
-    state.abortController.abort();
-  }
+  if (state.abortController) state.abortController.abort();
 }
 
 function toggleSending(active) {
@@ -367,9 +737,7 @@ async function streamCompletion(body, onDelta, signal) {
           content += delta;
           onDelta(delta);
         }
-      } catch (_) {
-        // Ignore non-JSON SSE lines.
-      }
+      } catch (_) {}
     }
   }
   return { content, headers };
@@ -399,20 +767,11 @@ function appendMessageBubble(role, initialText) {
 function decorateAssistantBubble(bubble, headers, elapsedSeconds, text) {
   if (!bubble.badge) return;
   bubble.badge.innerHTML = "";
-  if (headers.worker) {
-    bubble.badge.appendChild(makePill(`worker ${headers.worker}`, "worker"));
-  }
-  if (headers.cost) {
-    bubble.badge.appendChild(makePill(`cost ${parseFloat(headers.cost).toFixed(3)}`));
-  }
-  if (headers.matchedTokens) {
-    bubble.badge.appendChild(makePill(`match ${headers.matchedTokens}t`));
-  }
+  if (headers.worker) bubble.badge.appendChild(makePill(`worker ${headers.worker}`, "worker"));
+  if (headers.cost) bubble.badge.appendChild(makePill(`cost ${parseFloat(headers.cost).toFixed(3)}`));
+  if (headers.matchedTokens) bubble.badge.appendChild(makePill(`match ${headers.matchedTokens}t`));
   const attempts = parseInt(headers.attempts || "1", 10);
-  if (attempts > 1) {
-    // Only call out retries — single-attempt is the boring default.
-    bubble.badge.appendChild(makePill(`${attempts} tries`));
-  }
+  if (attempts > 1) bubble.badge.appendChild(makePill(`${attempts} tries`));
   bubble.badge.appendChild(makePill(`${elapsedSeconds.toFixed(2)}s`));
   const tokens = Math.max(1, Math.round(text.length / 4));
   bubble.badge.appendChild(makePill(`~${(tokens / Math.max(0.01, elapsedSeconds)).toFixed(1)} tok/s`));
@@ -431,15 +790,10 @@ function renderDecisionDetail(headers, elapsedSeconds, text) {
     el.detailCost.textContent = "—";
     return;
   }
-  el.detailCost.textContent = headers.cost
-    ? parseFloat(headers.cost).toFixed(3)
-    : "—";
+  el.detailCost.textContent = headers.cost ? parseFloat(headers.cost).toFixed(3) : "—";
   const promptTokens = headers.promptTokens || "—";
   const matchedTokens = headers.matchedTokens || "0";
-  const overlap = headers.overlap
-    ? `${(parseFloat(headers.overlap) * 100).toFixed(0)}%`
-    : "—";
-
+  const overlap = headers.overlap ? `${(parseFloat(headers.overlap) * 100).toFixed(0)}%` : "—";
   const approxTokens = Math.max(1, Math.round(text.length / 4));
   const tokRate = (approxTokens / Math.max(0.01, elapsedSeconds)).toFixed(1);
 
@@ -454,9 +808,9 @@ function renderDecisionDetail(headers, elapsedSeconds, text) {
     <div class="detail-section">
       <div class="detail-section-title">Prefix Cache</div>
       <dl class="detail-kv">
-        <dt>prompt tokens</dt><dd>${promptTokens}</dd>
-        <dt>matched tokens</dt><dd>${matchedTokens}</dd>
-        <dt>overlap</dt><dd>${overlap}</dd>
+        <dt>prompt tokens</dt><dd>${escapeHtml(String(promptTokens))}</dd>
+        <dt>matched tokens</dt><dd>${escapeHtml(String(matchedTokens))}</dd>
+        <dt>overlap</dt><dd>${escapeHtml(overlap)}</dd>
       </dl>
     </div>
     <div class="detail-section">

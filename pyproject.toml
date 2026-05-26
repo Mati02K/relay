@@ -17,6 +17,7 @@ dependencies = [
     "zeroconf>=0.132",
     "pydantic>=2.7",
     "loguru>=0.7",
+    "nvidia-ml-py>=12.560.30",
 ]
 
 [project.scripts]

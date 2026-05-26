@@ -17,6 +17,7 @@ from relay.config import (
     NetworkConfig,
     NodeRole,
     RelayConfig,
+    SchedulerConfig,
     WorkerConfig,
     coordinator_host_from_url,
     normalize_coordinator_url,
@@ -83,6 +84,9 @@ def run_init(options: InitOptions) -> RelayConfig:
 
     if config.runs_worker and not options.skip_model:
         config = _configure_model(config, options)
+
+    if config.runs_coordinator:
+        config = _configure_scheduler(config)
 
     print("Preparing runtime software...")
     ensure_runtime_software(config)
@@ -156,9 +160,7 @@ def _configure_model(config: RelayConfig, options: InitOptions) -> RelayConfig:
     if action == "skip":
         return config
     if action == "local":
-        path = _prompt_text("Local GGUF path", required=True)
-        model_id = _prompt_text("Model id", default=Path(path).stem, required=False)
-        return register_local_model(config, model_id, Path(path))
+        return _select_local_model(config)
 
     print("Available models:")
     for index, model in enumerate(MODEL_CATALOG, start=1):
@@ -167,6 +169,137 @@ def _configure_model(config: RelayConfig, options: InitOptions) -> RelayConfig:
     selected = _resolve_catalog_model_selection(selected)
     updated, _ = pull_catalog_model(config, selected)
     return updated
+
+
+def _configure_scheduler(config: RelayConfig) -> RelayConfig:
+    """Ask whether to keep default scheduler weights or tune each one.
+
+    Only runs for coordinator/dual nodes — workers don't schedule anyone.
+    Default keeps all five weights at 1.0 (paper-style equal influence).
+    Advanced asks one prompt per weight, defaulting to the current value.
+    """
+    action = _prompt_choice(
+        "Scheduler tuning",
+        ("default", "advanced"),
+        default="default",
+        suffix={
+            "default": "all weights = 1.0 (recommended)",
+            "advanced": "tune queue / prefix / memory / jitter / thermal",
+        },
+    )
+    if action == "default":
+        return config
+
+    print(
+        "Pick a weight per signal in the range [0.0, 1.0]. "
+        "1.0 = full influence, 0.0 = signal disabled, in-between dampens it."
+    )
+    print("Enter to keep the current value.")
+    current = config.scheduler
+    weights = SchedulerConfig(
+        queue=_prompt_float(
+            "Queue weight (deep queue vs. decode speed)",
+            default=current.queue,
+        ),
+        prefix_miss=_prompt_float(
+            "Prefix-miss weight (rewards cache hits)",
+            default=current.prefix_miss,
+        ),
+        memory=_prompt_float(
+            "Memory weight (KV/RAM pressure)",
+            default=current.memory,
+        ),
+        jitter=_prompt_float(
+            "Jitter weight (flaky network paths)",
+            default=current.jitter,
+        ),
+        thermal=_prompt_float(
+            "Thermal weight (throttled workers)",
+            default=current.thermal,
+        ),
+    )
+    return config.model_copy(update={"scheduler": weights})
+
+
+def _prompt_float(label: str, *, default: float) -> float:
+    """Prompt for a weight in ``[0.0, 1.0]``; blank input keeps ``default``."""
+    while True:
+        raw = input(f"{label} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            print(f"Invalid number: {raw!r}. Try again.")
+            continue
+        if value < 0.0 or value > 1.0:
+            print(f"Weight must be between 0.0 and 1.0 (got {value}). Try again.")
+            continue
+        return value
+
+
+def _select_local_model(config: RelayConfig) -> RelayConfig:
+    """Pick a GGUF from ``~/.relay/models/`` by number, no path typing required.
+
+    Falls back to asking for an absolute path only when no downloaded GGUFs
+    are found (e.g. nothing pulled yet).
+    """
+    paths = RelayPaths.from_home()
+    found = _discover_local_ggufs(paths.models)
+    if not found:
+        print(
+            "No GGUF files found in",
+            paths.models,
+            "— pulling one is usually easier than typing a path.",
+        )
+        raw_path = _prompt_text("Local GGUF path", required=True)
+        chosen = Path(raw_path).expanduser()
+        return register_local_model(config, chosen.stem, chosen)
+
+    print("Local GGUFs found:")
+    for index, (label, path) in enumerate(found, start=1):
+        print(f"  {index}. {label}")
+    default_index = "1"
+    raw = _prompt_text(
+        "Pick a model number",
+        default=default_index,
+        required=False,
+    )
+    chosen_path = _resolve_local_pick(raw, found)
+    # Model id = filename stem. Skip the extra prompt — users picked from a
+    # menu, no need for a second decision. Rename via config.json if needed.
+    return register_local_model(config, chosen_path.stem, chosen_path)
+
+
+def _discover_local_ggufs(models_root: Path) -> list[tuple[str, Path]]:
+    """Return ``(label, path)`` pairs for every GGUF under the Relay models dir.
+
+    Sorted alphabetically by label so menu numbering is stable across runs.
+    """
+    if not models_root.is_dir():
+        return []
+    discovered: list[tuple[str, Path]] = []
+    for gguf in sorted(models_root.rglob("*.gguf")):
+        try:
+            rel = gguf.relative_to(models_root)
+        except ValueError:
+            rel = Path(gguf.name)
+        size_gb = gguf.stat().st_size / (1024**3)
+        label = f"{rel} ({size_gb:.1f} GB)"
+        discovered.append((label, gguf))
+    return discovered
+
+
+def _resolve_local_pick(raw: str, found: list[tuple[str, Path]]) -> Path:
+    """Resolve a menu number into the chosen path; raise on invalid input."""
+    value = raw.strip()
+    if not value:
+        return found[0][1]
+    if value.isdigit():
+        idx = int(value)
+        if 1 <= idx <= len(found):
+            return found[idx - 1][1]
+    raise ConfigError(f"Invalid selection '{raw}'. Pick a number between 1 and {len(found)}.")
 
 
 def _prompt_choice(

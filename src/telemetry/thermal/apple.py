@@ -21,6 +21,8 @@ import shutil
 
 from loguru import logger
 
+from telemetry.thermal.base import ThermalSourceSample
+
 _SWIFT_SCRIPT = "import Foundation; print(ProcessInfo.processInfo.thermalState.rawValue)"
 _THROTTLE_THRESHOLD = 2  # serious or critical
 _PROBE_TIMEOUT_SECONDS = 2.0
@@ -42,6 +44,28 @@ def thermal_state_to_theta_w(value: int) -> int:
     return 1 if value >= _THROTTLE_THRESHOLD else 0
 
 
+def thermal_state_to_pressure(value: int) -> float:
+    """Map Apple's four-bucket thermal state to normalized pressure."""
+    if value <= 0:
+        return 0.0
+    if value == 1:
+        return 0.35
+    if value == 2:
+        return 0.75
+    return 1.0
+
+
+def thermal_state_to_label(value: int) -> str:
+    """Return a dashboard-friendly label for Apple's thermal state."""
+    if value <= 0:
+        return "normal"
+    if value == 1:
+        return "warm"
+    if value == 2:
+        return "throttling"
+    return "critical"
+
+
 class MacOSThermalStateCollector:
     """Reads ``NSProcessInfo.thermalState`` via a non-privileged Swift subprocess."""
 
@@ -59,8 +83,8 @@ class MacOSThermalStateCollector:
             return None
         return cls(swift_binary=swift_binary)
 
-    async def sample(self) -> int:
-        """Return 1 if thermal state is ``serious`` or ``critical``."""
+    async def sample(self) -> list[ThermalSourceSample]:
+        """Return normalized thermal pressure from ``NSProcessInfo``."""
         try:
             process = await asyncio.create_subprocess_exec(
                 self._swift_binary,
@@ -71,7 +95,7 @@ class MacOSThermalStateCollector:
             )
         except (OSError, FileNotFoundError) as e:
             logger.debug("Swift subprocess failed | error={}", e)
-            return 0
+            return []
 
         try:
             stdout, _ = await asyncio.wait_for(
@@ -81,14 +105,30 @@ class MacOSThermalStateCollector:
         except TimeoutError:
             process.kill()
             await process.wait()
-            return 0
+            return []
 
         if process.returncode != 0:
-            return 0
+            return []
         parsed = parse_thermal_state_output(stdout.decode(errors="replace"))
         if parsed is None:
-            return 0
-        return thermal_state_to_theta_w(parsed)
+            return []
+        pressure = thermal_state_to_pressure(parsed)
+        logger.debug(
+            "macOS thermal sample | rawState={} pressure={:.3f}",
+            parsed,
+            pressure,
+        )
+        return [
+            ThermalSourceSample(
+                source=self.name,
+                device_type="system",
+                pressure=pressure,
+                state=thermal_state_to_label(parsed),
+                confidence=0.90,
+                throttle_active=parsed >= _THROTTLE_THRESHOLD,
+                details={"raw_state": parsed},
+            )
+        ]
 
     async def close(self) -> None:
         """No persistent resources."""

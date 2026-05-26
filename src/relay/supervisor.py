@@ -92,12 +92,12 @@ def stop(config: RelayConfig | None = None) -> list[ProcessStatus]:
             pid_path.unlink(missing_ok=True)
             statuses.append(ProcessStatus(name, False, pid, "not running"))
             continue
-        os.kill(pid, signal.SIGTERM)
+        _signal_group(pid, signal.SIGTERM)
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and _pid_running(pid):
             time.sleep(0.2)
         if _pid_running(pid):
-            os.kill(pid, signal.SIGKILL)
+            _signal_group(pid, signal.SIGKILL)
         pid_path.unlink(missing_ok=True)
         statuses.append(ProcessStatus(name, False, pid, "stopped"))
     return statuses
@@ -171,6 +171,15 @@ def build_process_specs(config: RelayConfig | None, paths: RelayPaths) -> list[M
         coordinator_env = common_env.copy()
         coordinator_env["COORDINATOR_HOST"] = config.coordinator.host
         coordinator_env["COORDINATOR_PORT"] = str(config.coordinator.port)
+        # Scheduler weights are read from env at scheduler.py import time
+        # (see RELAY_SCHED_*_WEIGHT constants there). Pipe the config values
+        # through so the persisted choice from `relay init` actually takes
+        # effect on the coordinator process.
+        coordinator_env["RELAY_SCHED_QUEUE_WEIGHT"] = str(config.scheduler.queue)
+        coordinator_env["RELAY_SCHED_PREFIX_MISS_WEIGHT"] = str(config.scheduler.prefix_miss)
+        coordinator_env["RELAY_SCHED_MEMORY_WEIGHT"] = str(config.scheduler.memory)
+        coordinator_env["RELAY_SCHED_JITTER_WEIGHT"] = str(config.scheduler.jitter)
+        coordinator_env["RELAY_SCHED_THERMAL_WEIGHT"] = str(config.scheduler.thermal)
         specs.append(
             ManagedProcess(
                 name="coordinator",
@@ -287,6 +296,25 @@ def _llama_server_binary(configured: str) -> str:
     if resolved:
         return resolved
     return ensure_llama_server()
+
+
+def _signal_group(pid: int, sig: signal.Signals) -> None:
+    """Send a signal to the process group of pid.
+
+    Each managed process is started with ``start_new_session=True``, making it
+    the leader of its own process group. Sending to the group rather than just
+    the PID ensures all children (e.g. llama-server spawned by the worker) are
+    reached in a single call. Falls back to a direct pid kill if the group
+    lookup fails (process already gone, permission denied, etc.).
+    """
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
 
 def _start_background(spec: ManagedProcess) -> int:

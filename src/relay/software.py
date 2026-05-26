@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tarfile
@@ -16,6 +17,7 @@ from typing import Any
 
 from relay.config import RelayConfig
 from relay.paths import RelayPaths
+from telemetry.thermal.nvidia import NvidiaNvmlCollector
 
 LLAMA_CPP_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 GO_RELEASE_API = "https://go.dev/dl/?mode=json"
@@ -52,11 +54,91 @@ def resolve_executable(configured: str | None, fallback_name: str) -> str | None
 
 def ensure_runtime_software(config: RelayConfig) -> None:
     """Install or build runtime software required by the selected node role."""
+    # Proto stubs are needed by both coordinator and worker — they're how every
+    # Relay process talks to membership-etcd over gRPC. Regenerate before any
+    # other setup so the rest of init can import membership safely.
+    ensure_proto_stubs()
     if config.runs_coordinator:
         ensure_etcd()
         ensure_membership_etcd()
     if config.runs_worker:
         ensure_llama_server()
+
+
+def ensure_proto_stubs() -> None:
+    """Regenerate the Python gRPC stubs from ``proto/relay.proto`` if absent.
+
+    The generated files (``relay_pb2.py`` + ``relay_pb2_grpc.py``) are
+    ``.gitignored`` so fresh clones never have them. Rather than asking the
+    user to run ``make proto`` by hand, we detect the missing import on every
+    ``relay init`` and rebuild quietly. Bundled with ``grpcio-tools`` (an
+    install dependency), so no extra software is required.
+    """
+    import membership  # local import: re-resolves after stubs are written
+
+    membership_dir = Path(membership.__file__).parent
+    stub_files = (
+        membership_dir / "relay_pb2.py",
+        membership_dir / "relay_pb2_grpc.py",
+    )
+    if all(stub.exists() for stub in stub_files):
+        return
+
+    proto_file = _locate_proto_file(membership_dir)
+    if proto_file is None:
+        raise RuntimeError(
+            "gRPC stubs are missing and proto/relay.proto cannot be located. "
+            "Re-install Relay from source (`uv pip install -e .`) so the proto "
+            "is available, or run `make proto` manually."
+        )
+
+    try:
+        from grpc_tools import protoc  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise RuntimeError(
+            "grpcio-tools is required to regenerate stubs. "
+            "Install Relay's dependencies first (`uv pip install -e .[dev]`)."
+        ) from e
+
+    argv = [
+        "grpc_tools.protoc",
+        f"-I{proto_file.parent}",
+        f"--python_out={membership_dir}",
+        f"--grpc_python_out={membership_dir}",
+        str(proto_file),
+    ]
+    rc = protoc.main(argv)
+    if rc != 0:
+        raise RuntimeError(f"grpc_tools.protoc exited with status {rc}")
+    _fix_grpc_stub_import(membership_dir / "relay_pb2_grpc.py")
+
+
+def _locate_proto_file(membership_dir: Path) -> Path | None:
+    """Find ``proto/relay.proto`` walking up from the membership package dir."""
+    # In editable installs the layout is .../src/membership; the proto sits at
+    # .../proto/relay.proto, two levels up. Walk a few parents to be safe.
+    current = membership_dir
+    for _ in range(4):
+        candidate = current / "proto" / "relay.proto"
+        if candidate.is_file():
+            return candidate
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def _fix_grpc_stub_import(grpc_stub: Path) -> None:
+    """Rewrite ``import relay_pb2`` to ``from . import relay_pb2`` in-place.
+
+    ``grpc_tools.protoc`` emits an absolute import that doesn't resolve when
+    the stub is loaded as a submodule of ``membership``. Matches what the
+    Makefile's sed does.
+    """
+    text = grpc_stub.read_text()
+    fixed = re.sub(r"^import relay_pb2", "from . import relay_pb2", text, flags=re.MULTILINE)
+    if fixed != text:
+        grpc_stub.write_text(fixed)
 
 
 def ensure_etcd() -> str:
@@ -449,6 +531,7 @@ def doctor_checks(config: RelayConfig | None) -> list[CheckResult]:
                 llama_server or "missing now; relay start will auto-install llama.cpp",
             )
         )
+        checks.append(CheckResult("thermal sources", True, _thermal_source_summary()))
         model = config.active_model()
         if model is None:
             checks.append(CheckResult("model", False, "no model configured"))
@@ -457,3 +540,57 @@ def doctor_checks(config: RelayConfig | None) -> list[CheckResult]:
             checks.append(CheckResult("model", model_path.exists(), str(model_path)))
 
     return checks
+
+
+def _thermal_source_summary() -> str:
+    """Return a human-readable summary of thermal sources this host can expose."""
+    system = platform.system().lower()
+    sources: list[str] = []
+    if system == "linux":
+        cpu_throttle = Path("/sys/devices/system/cpu").glob(
+            "cpu[0-9]*/thermal_throttle/*_throttle_count"
+        )
+        if any(cpu_throttle):
+            sources.append("linux cpu throttle counters")
+        if Path("/sys/class/thermal").exists():
+            sources.append("linux thermal zones")
+        if any(_is_amdgpu_hwmon(hwmon) for hwmon in Path("/sys/class/hwmon").glob("hwmon*")):
+            sources.append("amd gpu hwmon")
+        nvidia = _nvidia_nvml_summary()
+        if nvidia:
+            sources.append(nvidia)
+    elif system == "darwin":
+        swift = shutil.which("swift")
+        sources.append(
+            f"macOS ProcessInfo via {swift}" if swift else "macOS ProcessInfo unavailable"
+        )
+    elif system == "windows":
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        sources.append(
+            f"Windows thermal zones via {powershell}"
+            if powershell
+            else "Windows thermal zones unavailable"
+        )
+        nvidia = _nvidia_nvml_summary()
+        if nvidia:
+            sources.append(nvidia)
+    if sources:
+        return ", ".join(sources)
+    return "no thermal source detected; telemetry will be unknown"
+
+
+def _is_amdgpu_hwmon(hwmon: Path) -> bool:
+    try:
+        return (hwmon / "name").read_text(errors="replace").strip().lower() == "amdgpu"
+    except OSError:
+        return False
+
+
+def _nvidia_nvml_summary() -> str | None:
+    collector = NvidiaNvmlCollector.try_create()
+    if collector is None:
+        return None
+    try:
+        return f"NVIDIA NVML via {collector.name}"
+    finally:
+        collector.close_sync()

@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, AsyncIterator
+from typing import Any, AsyncGenerator, AsyncIterator, cast
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -15,6 +15,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 import logger as loggerSetup
+from coordinator import scheduler as scheduler_module
 from coordinator.scheduler import SchedulingError, WorkerChoice, choose_worker
 from coordinator.worker_registry import WorkerSnapshot, fetch_worker_snapshots
 from membership.etcd import EtcdMembership
@@ -288,6 +289,51 @@ async def listWorkers() -> list[dict[str, Any]]:
     ]
 
 
+@app.get("/v1/scheduler/weights")
+async def getSchedulerWeights() -> dict[str, float]:
+    """Return the live cost-function weights the scheduler is using right now."""
+    _requireActive()
+    return scheduler_module.WEIGHTS.as_dict()
+
+
+@app.post("/v1/scheduler/weights")
+async def setSchedulerWeights(payload: dict[str, float]) -> dict[str, float]:
+    """Hot-swap one or more cost-function weights without a process restart.
+
+    Accepts a partial JSON body — only the keys present are updated. All
+    values must be floats in ``[0.0, 1.0]``; anything else is rejected.
+    Returns the post-update snapshot.
+    """
+    _requireActive()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object of weights")
+    allowed = set(scheduler_module.WEIGHTS.as_dict().keys())
+    updates: dict[str, float] = {}
+    for key, raw_value in payload.items():
+        if key not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown weight '{key}'. Allowed: {sorted(allowed)}",
+            )
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Weight '{key}' must be a number (got {raw_value!r})",
+            ) from e
+        if not 0.0 <= value <= 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Weight '{key}' must be between 0.0 and 1.0 (got {value})",
+            )
+        updates[key] = value
+    if updates:
+        scheduler_module.WEIGHTS.update(**updates)
+        logger.info("Scheduler weights updated | {}", updates)
+    return scheduler_module.WEIGHTS.as_dict()
+
+
 async def _ready_worker_snapshots(workers: Sequence[WorkerSnapshot]) -> list[WorkerSnapshot]:
     """Return workers whose HTTP health reports an active inference engine."""
     health_by_node = await _worker_health_states(workers)
@@ -319,7 +365,7 @@ async def _worker_health_states(workers: Sequence[WorkerSnapshot]) -> dict[str, 
             )
             health_by_node[worker.node_id] = _unknown_worker_health(str(result))
         else:
-            health_by_node[worker.node_id] = result
+            health_by_node[worker.node_id] = cast(dict[str, Any], result)
     return health_by_node
 
 
@@ -354,16 +400,17 @@ async def _worker_health_state(
     engine = body.get("engine") if isinstance(body, dict) else None
     if not isinstance(engine, dict) or engine.get("status") is not True:
         detail = engine.get("detail") if isinstance(engine, dict) else "missing engine health"
+        detail_text = str(detail)
         logger.warning(
             "Skipping worker with inactive engine | worker={} detail={}",
             worker.node_id,
-            detail,
+            detail_text,
         )
         return {
             "healthy": False,
             "status_code": response.status_code,
-            "detail": detail,
-            "engine": engine if isinstance(engine, dict) else _unknown_engine_health(detail),
+            "detail": detail_text,
+            "engine": engine if isinstance(engine, dict) else _unknown_engine_health(detail_text),
             "body": body,
         }
     return {
@@ -375,7 +422,10 @@ async def _worker_health_state(
     }
 
 
-def _unknown_worker_health(detail: str = "unknown", status_code: int | None = None) -> dict[str, Any]:
+def _unknown_worker_health(
+    detail: str = "unknown",
+    status_code: int | None = None,
+) -> dict[str, Any]:
     """Return a normalized unhealthy worker health payload."""
     return {
         "healthy": False,

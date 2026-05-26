@@ -42,20 +42,29 @@ def style(text: str, *codes: str) -> str:
 
 def banner(subtitle: str = "distributed llm serving for consumer machines") -> str:
     """Return the ASCII Relay banner with the configured colour."""
-    art = (
-        " ____  _____ _        _ __   __\n"
-        "|  _ \\| ____| |      / \\\\ \\ / /\n"
-        "| |_) |  _| | |     / _ \\\\ V / \n"
-        "|  _ <| |___| |___ / ___ \\| |  \n"
-        "|_| \\_\\_____|_____/_/   \\_\\_|  \n"
+    art_lines = (
+        " ____  _____ _        _ __   __",
+        "|  _ \\| ____| |      / \\\\ \\ / /",
+        "| |_) |  _| | |     / _ \\\\ V / ",
+        "|  _ <| |___| |___ / ___ \\| |  ",
+        "|_| \\_\\_____|_____/_/   \\_\\_|  ",
     )
+    art_width = max(len(line) for line in art_lines)
+    art = "\n".join(art_lines) + "\n"
+    url = "https://github.com/Mati02K/relay"
     return (
         "\n"
         + style(art, AMBER, BOLD)
-        + style(f"  {subtitle}\n", DIM_GREY)
-        + style("  https://github.com/Mati02K/relay\n", DIM_GREY)
+        + style(_center(subtitle, art_width) + "\n", DIM_GREY)
+        + style(_center(url, art_width) + "\n", DIM_GREY)
         + "\n"
     )
+
+
+def _center(text: str, width: int) -> str:
+    """Center ``text`` within ``width`` columns; left-align if it's wider."""
+    pad = max(0, (width - len(text)) // 2)
+    return " " * pad + text
 
 
 def ok(text: str) -> str:
@@ -81,6 +90,16 @@ def accent(text: str) -> str:
 def muted(text: str) -> str:
     """Format dim secondary text."""
     return style(text, DIM_GREY)
+
+
+def name_column(name: str, width: int = 20) -> str:
+    """Return a coloured, left-padded process name column.
+
+    Padding happens before colouring so the visible width is consistent — ANSI
+    escape codes don't count, which avoids the ``f"{accent(x):24}"`` trap where
+    the colour codes inflate the format width and break alignment.
+    """
+    return accent((name + ":").ljust(width))
 
 
 def status_label(running: bool, detail: str) -> str:

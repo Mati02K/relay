@@ -73,6 +73,42 @@ async def config() -> dict[str, str]:
     return {"coordinator_url": coordinator_url()}
 
 
+@app.get("/api/scheduler/weights")
+async def get_scheduler_weights(request: Request) -> dict[str, float]:
+    """Proxy the coordinator's live scheduler weights for the Settings view."""
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        response = await client.get(f"{coordinator_url()}/v1/scheduler/weights")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Coordinator unreachable: {e}") from e
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.text[:500])
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Unexpected weights payload")
+    return {k: float(v) for k, v in payload.items()}
+
+
+@app.post("/api/scheduler/weights")
+async def set_scheduler_weights(request: Request) -> dict[str, float]:
+    """Forward an Apply from the Settings view to the coordinator."""
+    body = await request.json()
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        response = await client.post(
+            f"{coordinator_url()}/v1/scheduler/weights",
+            json=body,
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Coordinator unreachable: {e}") from e
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.text[:500])
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Unexpected weights payload")
+    return {k: float(v) for k, v in payload.items()}
+
+
 @app.get("/api/workers")
 async def workers(request: Request) -> list[dict[str, Any]]:
     """Proxy the coordinator's worker registry for the sidebar."""

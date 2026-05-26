@@ -22,7 +22,7 @@ from relay.supervisor import (
     status,
     stop,
 )
-from relay.ui import accent, banner, err, muted, ok, status_label, warn
+from relay.ui import accent, banner, err, muted, name_column, ok, status_label, warn
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,6 +57,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     stop_parser = sub.add_parser("stop", help="stop Relay processes")
     stop_parser.set_defaults(func=_cmd_stop)
+
+    restart_parser = sub.add_parser(
+        "restart",
+        help="stop and then start Relay processes",
+    )
+    restart_parser.add_argument("--foreground", action="store_true")
+    restart_parser.set_defaults(func=_cmd_restart)
 
     status_parser = sub.add_parser("status", help="show process and HTTP health")
     status_parser.add_argument("--json", action="store_true")
@@ -139,9 +146,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     config = load_config()
     print(banner(), end="")
     statuses = start(config, foreground=bool(args.foreground))
-    for item in statuses:
-        pid = muted(f" pid={item.pid}") if item.pid else ""
-        print(f"{accent(item.name + ':'):24} {ok(item.detail)}{pid}")
+    _print_start_or_stop(statuses)
     return 0
 
 
@@ -150,10 +155,18 @@ def _cmd_stop(args: argparse.Namespace) -> int:
         config = load_config()
     except ConfigError:
         config = None
-    for item in stop(config):
-        pid = muted(f" pid={item.pid}") if item.pid else ""
-        label = muted(item.detail) if "no pid" in item.detail else ok(item.detail)
-        print(f"{accent(item.name + ':'):24} {label}{pid}")
+    _print_start_or_stop(stop(config))
+    return 0
+
+
+def _cmd_restart(args: argparse.Namespace) -> int:
+    config = load_config()
+    print(banner(), end="")
+    print(accent("stopping...\n"))
+    _print_start_or_stop(stop(config))
+    print()
+    print(accent("starting...\n"))
+    _print_start_or_stop(start(config, foreground=bool(args.foreground)))
     return 0
 
 
@@ -166,15 +179,33 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         print(process_status_json(statuses))
     else:
+        print()
         for item in statuses:
             pid_text = str(item.pid) if item.pid is not None else "-"
             state = status_label(item.running, item.detail)
-            print(f"{accent(item.name + ':'):24} {state:24} {muted('pid=' + pid_text)}")
+            # Pad the plain state text first, then optionally colour; the
+            # ANSI escapes don't count toward visible width.
+            print(f"  {name_column(item.name)} {state.ljust(20)} {muted('pid=' + pid_text)}")
+        print()
     if config is not None and any(item.running for item in statuses):
         health = health_summary(config)
         if health:
             print(json.dumps(health, indent=2))
     return 0
+
+
+def _print_start_or_stop(statuses: list) -> None:  # type: ignore[type-arg]
+    """Render a list of ProcessStatus rows with consistent column alignment."""
+    print()
+    for item in statuses:
+        pid = muted(f"pid={item.pid}") if item.pid else muted("")
+        detail = item.detail.lower()
+        if "no pid" in detail or "not running" in detail or "stopped" in detail:
+            label = muted(item.detail)
+        else:
+            label = ok(item.detail)
+        print(f"  {name_column(item.name)} {label}  {pid}")
+    print()
 
 
 def _cmd_logs(args: argparse.Namespace) -> int:

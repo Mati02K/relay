@@ -20,6 +20,12 @@ import shutil
 
 from loguru import logger
 
+from telemetry.thermal.base import (
+    ThermalSourceSample,
+    pressure_from_temperature,
+    pressure_to_state,
+)
+
 _POWERSHELL_COMMAND = (
     "Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature "
     "| Select-Object -ExpandProperty CurrentTemperature "
@@ -82,8 +88,8 @@ class WindowsCpuThermalCollector:
             return None
         return cls(powershell_binary=binary, threshold_celsius=threshold_celsius)
 
-    async def sample(self) -> int:
-        """Return 1 if any thermal zone temperature crosses the threshold."""
+    async def sample(self) -> list[ThermalSourceSample]:
+        """Return normalized thermal-zone pressure samples."""
         try:
             process = await asyncio.create_subprocess_exec(
                 self._powershell_binary,
@@ -96,7 +102,7 @@ class WindowsCpuThermalCollector:
             )
         except (OSError, FileNotFoundError) as e:
             logger.debug("PowerShell subprocess failed | error={}", e)
-            return 0
+            return []
 
         try:
             stdout, _ = await asyncio.wait_for(
@@ -106,12 +112,35 @@ class WindowsCpuThermalCollector:
         except TimeoutError:
             process.kill()
             await process.wait()
-            return 0
+            return []
 
         if process.returncode != 0:
-            return 0
+            return []
         temperatures = parse_powershell_temperatures(stdout.decode(errors="replace"))
-        return temperatures_to_theta_w(temperatures, self._threshold_celsius)
+        samples: list[ThermalSourceSample] = []
+        for index, temp_c in enumerate(temperatures):
+            pressure = pressure_from_temperature(temp_c, self._threshold_celsius)
+            logger.debug(
+                "Windows thermal sample | zone={} tempC={} limitC={} pressure={:.3f}",
+                index,
+                temp_c,
+                self._threshold_celsius,
+                pressure,
+            )
+            samples.append(
+                ThermalSourceSample(
+                    source=self.name,
+                    device_type="system",
+                    pressure=pressure,
+                    state=pressure_to_state(pressure),
+                    confidence=0.60,
+                    temperature_c=temp_c,
+                    limit_c=self._threshold_celsius,
+                    throttle_active=temp_c >= self._threshold_celsius,
+                    details={"zone_index": index},
+                )
+            )
+        return samples
 
     async def close(self) -> None:
         """No persistent resources."""

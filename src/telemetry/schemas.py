@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from telemetry.prefix_cache import (
@@ -129,6 +131,55 @@ class RequestComputedTelemetry(BaseModel):
     )
 
 
+class ThermalSourceTelemetry(BaseModel):
+    """One raw thermal source normalized for cross-platform comparison."""
+
+    model_config = {"frozen": True}
+
+    source: str = Field(..., description="Collector/source name")
+    device_type: str = Field(..., description="cpu, gpu, system, or unknown")
+    pressure: float = Field(0.0, ge=0.0, le=1.0, description="Source pressure in [0, 1]")
+    state: str = Field("unknown", description="normal, warm, throttling, critical, or unknown")
+    confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that this source reflects actual thermal performance",
+    )
+    temperature_c: float | None = Field(None, description="Current temperature if available")
+    limit_c: float | None = Field(None, description="Thermal limit/threshold if available")
+    throttle_active: bool | None = Field(None, description="Whether source reports throttling")
+    details: dict[str, Any] = Field(default_factory=dict, description="Source-specific raw values")
+
+
+class ThermalTelemetry(BaseModel):
+    """Whole-worker thermal telemetry used by the scheduler and dashboard."""
+
+    model_config = {"frozen": True}
+
+    pressure: float = Field(0.0, ge=0.0, le=1.0, description="Final thermal pressure")
+    state: str = Field("unknown", description="normal, warm, throttling, critical, or unknown")
+    cpu_pressure: float = Field(0.0, ge=0.0, le=1.0, description="CPU thermal pressure")
+    gpu_pressure: float = Field(0.0, ge=0.0, le=1.0, description="GPU thermal pressure")
+    confidence: float = Field(0.0, ge=0.0, le=1.0, description="Best source confidence")
+    sources: list[ThermalSourceTelemetry] = Field(
+        default_factory=list,
+        description="Per-source thermal samples used to compute pressure",
+    )
+
+
+def default_thermal_telemetry() -> ThermalTelemetry:
+    """Return an explicit empty thermal snapshot for type checkers and Pydantic."""
+    return ThermalTelemetry(
+        pressure=0.0,
+        state="unknown",
+        cpu_pressure=0.0,
+        gpu_pressure=0.0,
+        confidence=0.0,
+        sources=[],
+    )
+
+
 class SystemTelemetry(BaseModel):
     """Telemetry supplied by worker-level system collectors outside the inference backend."""
 
@@ -139,11 +190,18 @@ class SystemTelemetry(BaseModel):
         ge=0.0,
         description="Network round-trip jitter in milliseconds, usually filled from heartbeats",
     )
-    theta_w: int = Field(
-        0,
-        ge=0,
-        le=1,
-        description="Thermal throttling flag: 0 means normal, 1 means throttled",
+    theta_w: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Normalized whole-system thermal pressure, where 0.0 is normal and "
+            "1.0 is critical throttling"
+        ),
+    )
+    thermal: ThermalTelemetry = Field(
+        default_factory=default_thermal_telemetry,
+        description="Structured thermal source details used to compute theta_w",
     )
 
 
@@ -178,11 +236,18 @@ class Telemetry(BaseModel):
         ge=0.0,
         description="Network round-trip jitter in milliseconds, usually filled from heartbeats",
     )
-    theta_w: int = Field(
-        0,
-        ge=0,
-        le=1,
-        description="Thermal throttling flag: 0 means normal, 1 means throttled",
+    theta_w: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Normalized whole-system thermal pressure, where 0.0 is normal and "
+            "1.0 is critical throttling"
+        ),
+    )
+    thermal: ThermalTelemetry = Field(
+        default_factory=default_thermal_telemetry,
+        description="Structured thermal source details used to compute theta_w",
     )
     prefix_cache: PrefixCacheTelemetry = Field(
         default_factory=lambda: PrefixCacheTelemetry.from_config(PrefixHashConfig.from_env(), []),
@@ -218,6 +283,7 @@ class Telemetry(BaseModel):
             mw=engine.mw,
             jw=system.jw,
             theta_w=system.theta_w,
+            thermal=system.thermal,
             prefix_cache=request.prefix_cache,
             sprefill_tokens_per_sec=request.sprefill_tokens_per_sec,
         )

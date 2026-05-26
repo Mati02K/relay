@@ -30,15 +30,56 @@ from telemetry.request_metrics import prompt_length_bucket_id
 from telemetry.schemas import Telemetry
 
 DEFAULT_DECODE_TOKENS_PER_SEC = float(os.getenv("RELAY_DEFAULT_DECODE_TOKENS_PER_SEC", "10"))
-
-# Paper formula weights. Defaults keep terms on similar order for current local
-# telemetry; production tuning should be based on real cluster measurements.
-QUEUE_WEIGHT = float(os.getenv("RELAY_SCHED_QUEUE_WEIGHT", "1.0"))
-PREFIX_MISS_WEIGHT = float(os.getenv("RELAY_SCHED_PREFIX_MISS_WEIGHT", "1.0"))
-MEMORY_WEIGHT = float(os.getenv("RELAY_SCHED_MEMORY_WEIGHT", "1.0"))
-JITTER_WEIGHT = float(os.getenv("RELAY_SCHED_JITTER_WEIGHT", "1.0"))
-THERMAL_WEIGHT = float(os.getenv("RELAY_SCHED_THERMAL_WEIGHT", "1.0"))
 DEFAULT_JITTER_MAX_MS = float(os.getenv("RELAY_SCHED_JITTER_MAX_MS", "1.0"))
+
+
+@dataclass
+class SchedulerWeights:
+    """Mutable container for the paper-style cost-function weights.
+
+    Held as a single object instead of module-level constants so the dashboard
+    can hot-swap values via ``POST /v1/scheduler/weights`` without a restart.
+    All weights are clamped to ``[0.0, 1.0]`` at the API layer.
+    """
+
+    queue: float = 1.0
+    prefix_miss: float = 1.0
+    memory: float = 1.0
+    jitter: float = 1.0
+    thermal: float = 1.0
+
+    @classmethod
+    def from_env(cls) -> SchedulerWeights:
+        """Initialise from ``RELAY_SCHED_*_WEIGHT`` env vars."""
+        return cls(
+            queue=float(os.getenv("RELAY_SCHED_QUEUE_WEIGHT", "1.0")),
+            prefix_miss=float(os.getenv("RELAY_SCHED_PREFIX_MISS_WEIGHT", "1.0")),
+            memory=float(os.getenv("RELAY_SCHED_MEMORY_WEIGHT", "1.0")),
+            jitter=float(os.getenv("RELAY_SCHED_JITTER_WEIGHT", "1.0")),
+            thermal=float(os.getenv("RELAY_SCHED_THERMAL_WEIGHT", "1.0")),
+        )
+
+    def update(self, **fields: float) -> None:
+        """Replace named fields in-place. Unknown names raise ``KeyError``."""
+        for name, value in fields.items():
+            if not hasattr(self, name):
+                raise KeyError(f"Unknown weight field: {name}")
+            setattr(self, name, float(value))
+
+    def as_dict(self) -> dict[str, float]:
+        """Return a JSON-friendly snapshot."""
+        return {
+            "queue": self.queue,
+            "prefix_miss": self.prefix_miss,
+            "memory": self.memory,
+            "jitter": self.jitter,
+            "thermal": self.thermal,
+        }
+
+
+# Live, mutable weights. Reads in `_score_worker` go through this object so
+# `.update(...)` from the API changes scheduling on the very next request.
+WEIGHTS = SchedulerWeights.from_env()
 
 
 class SchedulingError(RuntimeError):
@@ -115,11 +156,12 @@ def _score_worker(
 
     bucket = prompt_length_bucket_id(prompt_tokens)
     decode_speed = _decode_speed(telemetry, bucket)
-    queue_term = QUEUE_WEIGHT * telemetry.qw / decode_speed
-    prefix_term = PREFIX_MISS_WEIGHT * (1.0 - overlap)
-    memory_term = MEMORY_WEIGHT * telemetry.mw
-    jitter_term = JITTER_WEIGHT * telemetry.jw / jitter_max
-    thermal_term = THERMAL_WEIGHT * telemetry.theta_w
+    weights = WEIGHTS
+    queue_term = weights.queue * telemetry.qw / decode_speed
+    prefix_term = weights.prefix_miss * (1.0 - overlap)
+    memory_term = weights.memory * telemetry.mw
+    jitter_term = weights.jitter * telemetry.jw / jitter_max
+    thermal_term = weights.thermal * telemetry.theta_w
 
     return WorkerChoice(
         worker=worker,

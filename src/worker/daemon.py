@@ -16,7 +16,7 @@ from membership.base import MembershipLayer
 from membership.etcd import EtcdMembership
 from network.tailscale import TailscaleNetwork
 from telemetry.request_metrics import extract_usage_token_counts
-from telemetry.schemas import SystemTelemetry
+from telemetry.schemas import SystemTelemetry, ThermalSourceTelemetry, ThermalTelemetry
 from telemetry.state import WorkerTelemetryState
 from telemetry.thermal import ThermalAggregator, detect_thermal_collectors
 from worker.inference.base import InferenceEngine
@@ -54,7 +54,8 @@ class WorkerDaemon:
         self.inference_engine = inference_engine
         self.telemetry = telemetry or WorkerTelemetryState()
         self.thermal = thermal or ThermalAggregator(
-            detect_thermal_collectors(uses_gpu=inference_engine.uses_gpu)
+            detect_thermal_collectors(uses_gpu=inference_engine.uses_gpu),
+            primary_device="gpu" if inference_engine.uses_gpu else "cpu",
         )
         self.telemetry_interval_seconds = telemetry_interval_seconds
         self.thermal_interval_seconds = max(0.5, thermal_interval_seconds)
@@ -206,8 +207,14 @@ class WorkerDaemon:
     async def _collect_thermal_loop(self) -> None:
         while True:
             try:
-                theta_w = await self.thermal.sample()
-                await self.telemetry.update_system(SystemTelemetry(jw=0.0, theta_w=theta_w))
+                snapshot = await self.thermal.sample()
+                await self.telemetry.update_system(
+                    SystemTelemetry(
+                        jw=0.0,
+                        theta_w=snapshot.theta_w,
+                        thermal=_thermal_snapshot_to_schema(snapshot),
+                    )
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -296,3 +303,28 @@ def _worker_models() -> list[dict[str, Any]]:
             "loaded": True,
         }
     ]
+
+
+def _thermal_snapshot_to_schema(snapshot: Any) -> ThermalTelemetry:
+    """Convert thermal dataclasses into Pydantic telemetry schemas."""
+    return ThermalTelemetry(
+        pressure=snapshot.pressure,
+        state=snapshot.state,
+        cpu_pressure=snapshot.cpu_pressure,
+        gpu_pressure=snapshot.gpu_pressure,
+        confidence=snapshot.confidence,
+        sources=[
+            ThermalSourceTelemetry(
+                source=source.source,
+                device_type=source.device_type,
+                pressure=source.pressure,
+                state=source.state,
+                confidence=source.confidence,
+                temperature_c=source.temperature_c,
+                limit_c=source.limit_c,
+                throttle_active=source.throttle_active,
+                details=source.details,
+            )
+            for source in snapshot.sources
+        ],
+    )

@@ -162,6 +162,24 @@ class JitterProbe:
             logger.debug("Jitter probe failed | nodeId={} error={}", node_id, e)
             return
         if response.status_code != 200:
+            logger.debug(
+                "Jitter probe skipped | nodeId={} address={} status={}",
+                node_id,
+                address,
+                response.status_code,
+            )
             return
         rtt_ms = (time.perf_counter() - start) * 1000.0
         self.observe(node_id, rtt_ms)
+        state = self._state.get(node_id)
+        if state is not None:
+            logger.debug(
+                "Jitter probe sample | nodeId={} address={} rttMs={:.3f} "
+                "rttEmaMs={:.3f} jitterMs={:.3f} samples={}",
+                node_id,
+                address,
+                rtt_ms,
+                state.rtt_ema_ms,
+                state.jitter_ema_ms,
+                state.samples,
+            )

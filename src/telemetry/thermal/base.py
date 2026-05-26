@@ -1,25 +1,78 @@
-"""Thermal collector protocol, null implementation, and OR aggregator.
+"""Thermal collector protocol, null implementation, and pressure aggregator.
 
-A ``ThermalCollector`` produces a binary ``theta_w`` signal where ``1`` means
-the device is currently throttling (or imminently will) and ``0`` means normal.
-The worker daemon wires the per-platform collectors into a single aggregator
-and writes the OR-reduced value into ``SystemTelemetry.theta_w``.
+Collectors return normalized pressure samples instead of raw vendor values.
+``0.0`` means normal, ``1.0`` means severe/critical thermal pressure. The
+aggregator combines CPU, GPU, and system-level sources into one scheduler-facing
+``theta_w`` value while retaining raw source details for diagnostics.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from loguru import logger
 
+THERMAL_STATE_NORMAL = "normal"
+THERMAL_STATE_WARM = "warm"
+THERMAL_STATE_THROTTLING = "throttling"
+THERMAL_STATE_CRITICAL = "critical"
+THERMAL_STATE_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ThermalSourceSample:
+    """One normalized thermal observation from one device or OS source."""
+
+    source: str
+    device_type: str
+    pressure: float
+    state: str
+    confidence: float
+    temperature_c: float | None = None
+    limit_c: float | None = None
+    throttle_active: bool | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def normalized(self) -> ThermalSourceSample:
+        """Clamp numeric fields into stable ranges."""
+        return ThermalSourceSample(
+            source=self.source,
+            device_type=self.device_type,
+            pressure=clamp01(self.pressure),
+            state=self.state,
+            confidence=clamp01(self.confidence),
+            temperature_c=self.temperature_c,
+            limit_c=self.limit_c,
+            throttle_active=self.throttle_active,
+            details=dict(self.details),
+        )
+
+
+@dataclass(frozen=True)
+class ThermalSnapshot:
+    """Aggregate thermal pressure sent to worker telemetry."""
+
+    pressure: float
+    state: str
+    cpu_pressure: float
+    gpu_pressure: float
+    confidence: float
+    sources: list[ThermalSourceSample]
+
+    @property
+    def theta_w(self) -> float:
+        """Scheduler-facing thermal pressure in ``[0, 1]``."""
+        return self.pressure
+
 
 class ThermalCollector(Protocol):
-    """One thermal source. Returns 1 when throttling, 0 otherwise."""
+    """One thermal source. Returns normalized pressure samples."""
 
     name: str
 
-    async def sample(self) -> int:
-        """Return 0 or 1 for the latest observation."""
+    async def sample(self) -> list[ThermalSourceSample]:
+        """Return zero or more observations for the latest sample window."""
         ...
 
     async def close(self) -> None:
@@ -32,9 +85,17 @@ class NullThermalCollector:
 
     name = "null"
 
-    async def sample(self) -> int:
-        """Always return 0."""
-        return 0
+    async def sample(self) -> list[ThermalSourceSample]:
+        """Return an explicit unknown/normal sample."""
+        return [
+            ThermalSourceSample(
+                source=self.name,
+                device_type="system",
+                pressure=0.0,
+                state=THERMAL_STATE_UNKNOWN,
+                confidence=0.0,
+            )
+        ]
 
     async def close(self) -> None:
         """No-op."""
@@ -42,33 +103,64 @@ class NullThermalCollector:
 
 
 class ThermalAggregator:
-    """Composes multiple collectors into a single ``theta_w`` value.
+    """Composes multiple collectors into one normalized ``theta_w`` pressure.
 
-    The aggregator is intentionally defensive: a collector raising an exception
-    is treated as ``0`` for that tick, so a broken sensor never causes the
-    worker to advertise itself as throttled.
+    The final pressure is the highest source pressure. This is conservative:
+    any device in the inference path can make the worker a bad scheduling
+    target. The scheduler still gets a gradient rather than a binary flag.
     """
 
-    def __init__(self, collectors: list[ThermalCollector]) -> None:
+    def __init__(
+        self,
+        collectors: list[ThermalCollector],
+        *,
+        primary_device: str = "unknown",
+    ) -> None:
         self._collectors = list(collectors)
+        self._primary_device = primary_device
 
     @property
     def collector_names(self) -> list[str]:
         """Return the names of the underlying collectors for diagnostics."""
         return [collector.name for collector in self._collectors]
 
-    async def sample(self) -> int:
-        """Return ``1`` if any collector reports throttling, else ``0``."""
-        throttled = 0
+    async def sample(self) -> ThermalSnapshot:
+        """Return the latest aggregate thermal pressure."""
+        samples: list[ThermalSourceSample] = []
         for collector in self._collectors:
             try:
-                value = await collector.sample()
+                values = await collector.sample()
             except Exception:
                 logger.exception("Thermal collector raised | name={}", collector.name)
                 continue
-            if value:
-                throttled = 1
-        return throttled
+            for value in values:
+                sample = value.normalized()
+                logger.debug(
+                    "Thermal source sample | source={} device={} pressure={:.3f} "
+                    "state={} confidence={:.2f} tempC={} limitC={} throttled={} details={}",
+                    sample.source,
+                    sample.device_type,
+                    sample.pressure,
+                    sample.state,
+                    sample.confidence,
+                    sample.temperature_c,
+                    sample.limit_c,
+                    sample.throttle_active,
+                    sample.details,
+                )
+                samples.append(sample)
+        snapshot = aggregate_thermal_samples(samples, primary_device=self._primary_device)
+        logger.debug(
+            "Thermal aggregate sample | pressure={:.3f} state={} cpu={:.3f} "
+            "gpu={:.3f} confidence={:.2f} collectors={}",
+            snapshot.pressure,
+            snapshot.state,
+            snapshot.cpu_pressure,
+            snapshot.gpu_pressure,
+            snapshot.confidence,
+            self.collector_names,
+        )
+        return snapshot
 
     async def close(self) -> None:
         """Close every underlying collector, ignoring individual failures."""
@@ -77,3 +169,111 @@ class ThermalAggregator:
                 await collector.close()
             except Exception:
                 logger.exception("Thermal collector close failed | name={}", collector.name)
+
+
+def aggregate_thermal_samples(
+    samples: list[ThermalSourceSample],
+    *,
+    primary_device: str = "unknown",
+) -> ThermalSnapshot:
+    """Fuse source samples into one scheduler-facing thermal snapshot."""
+    normalized = [sample.normalized() for sample in samples]
+    if not normalized:
+        return ThermalSnapshot(
+            pressure=0.0,
+            state=THERMAL_STATE_UNKNOWN,
+            cpu_pressure=0.0,
+            gpu_pressure=0.0,
+            confidence=0.0,
+            sources=[],
+        )
+
+    cpu_pressure = max(
+        (sample.pressure for sample in normalized if sample.device_type == "cpu"),
+        default=0.0,
+    )
+    gpu_pressure = max(
+        (sample.pressure for sample in normalized if sample.device_type == "gpu"),
+        default=0.0,
+    )
+    has_gpu = any(sample.device_type == "gpu" and sample.confidence > 0 for sample in normalized)
+    has_cpu = any(sample.device_type == "cpu" and sample.confidence > 0 for sample in normalized)
+    if primary_device == "gpu" and has_gpu:
+        pressure = max(gpu_pressure, cpu_pressure * 0.35)
+    elif primary_device == "cpu" and has_cpu:
+        pressure = max(cpu_pressure, gpu_pressure * 0.50)
+    else:
+        pressure = max((sample.pressure for sample in normalized), default=0.0)
+    confidence = max((sample.confidence for sample in normalized), default=0.0)
+    return ThermalSnapshot(
+        pressure=pressure,
+        state=pressure_to_state(pressure),
+        cpu_pressure=cpu_pressure,
+        gpu_pressure=gpu_pressure,
+        confidence=confidence,
+        sources=normalized,
+    )
+
+
+def pressure_to_state(pressure: float) -> str:
+    """Map a normalized pressure value to a dashboard-friendly state."""
+    value = clamp01(pressure)
+    if value >= 0.9:
+        return THERMAL_STATE_CRITICAL
+    if value >= 0.65:
+        return THERMAL_STATE_THROTTLING
+    if value >= 0.35:
+        return THERMAL_STATE_WARM
+    return THERMAL_STATE_NORMAL
+
+
+def pressure_from_temperature(
+    temperature_c: float | None,
+    limit_c: float | None,
+    *,
+    warm_margin_c: float = 8.0,
+) -> float:
+    """Convert temperature and limit into normalized pressure.
+
+    Returns ``0`` unless ``temperature_c`` is within ``warm_margin_c`` of
+    ``limit_c``. Inside the margin we use a quadratic curve so being mildly
+    warm contributes only modest pressure — only readings close to the
+    actual throttle limit ramp the score up.
+
+    The defaults are deliberately conservative: a chip cruising at 88 °C
+    against a 100 °C trip point reads ``0``, because it isn't being
+    thermally clocked. Real throttling signals (explicit slowdown bits,
+    sysfs counter deltas) dominate this term anyway.
+    """
+    if temperature_c is None or limit_c is None or limit_c <= 0:
+        return 0.0
+    start_c = max(0.0, limit_c - warm_margin_c)
+    if temperature_c <= start_c:
+        return 0.0
+    ratio = clamp01((temperature_c - start_c) / max(1.0, limit_c - start_c))
+    # Quadratic: mid-margin ≈ 0.25 instead of 0.5; only near-limit pushes high.
+    return ratio * ratio
+
+
+def pressure_from_throttle_rate(events_per_second: float) -> float:
+    """Map Linux CPU throttle-event rate into normalized thermal pressure.
+
+    Linux throttle counters can increment for very brief firmware events that
+    are not visible as sustained user-facing slowdown. Treat low event rates as
+    transient hints, and reserve throttling/critical pressure for sustained
+    event rates.
+    """
+    if events_per_second <= 0:
+        return 0.0
+    if events_per_second < 2.0:
+        return 0.15
+    if events_per_second < 10.0:
+        return 0.35
+    if events_per_second < 50.0:
+        return 0.65
+    return 0.9
+
+
+def clamp01(value: float) -> float:
+    """Clamp ``value`` into ``[0, 1]``."""
+    return max(0.0, min(1.0, float(value)))
