@@ -317,34 +317,7 @@ This is the per-term ablation answer (from Phase A):
 | φ (phase) | bias long prompts to strong-compute workers | small effect; would matter more with bigger compute disparity |
 | ν (RouteLLM) | bias complex prompts to high-quality models | inert when no quality gap (Phase A); decisive in Phase B (see §8) |
 
-## 12. Caveats (honest)
-
-* **Single-host artifact.** Three `llama-server` subprocesses on one
-  MacBook share the same physical cores. Configurations that
-  concentrate load on one worker therefore look better than
-  configurations that spread it. On real distributed hardware each
-  worker has its own cores and spreading is a pure win. Multi-host
-  validation over Tailscale is the planned follow-up.
-* **Heuristic complexity score.** `estimate_complexity_score` is a
-  length + reasoning-keyword heuristic, not the BERT-style classifier
-  from the RouteLLM paper. Real classifier scores would have higher
-  resolution and a smaller `nu` would suffice.
-* **Self-judge bias in quality eval.** Gemma judging Gemma vs TinyLlama
-  is the best we can do locally; objective metrics are reported
-  alongside as a sanity check.
-* **30-prompt workload.** Larger workloads with more high-complexity
-  items would tighten the Phase B confidence interval.
-
-## 13. Pending work
-
-* Multi-machine validation over Tailscale (needs the team session).
-* Replace the heuristic complexity score with a fine-tuned BERT
-  classifier on a labelled prompt-quality dataset.
-* Wider workload with more long / high-complexity prompts.
-* Test the same scheduler against varying concurrency (currently c=4
-  baseline, c=6 only for the tight-SLO run).
-
-## 14. Reproducing on a fresh machine
+## 12. Reproducing on a fresh machine
 
 ```bash
 brew install etcd llama.cpp
