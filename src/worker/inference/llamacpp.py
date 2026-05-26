@@ -85,6 +85,8 @@ class LlamaCppEngine(InferenceEngine):
         async with self._lock:
             if self._proc and self._proc.returncode is None:
                 return
+            if self._proc and self._proc.returncode is not None:
+                await self._stop_locked()
             if not self._model_path:
                 raise RuntimeError(
                     "LLAMA_MODEL_PATH or model_path is required to start llama-server"
@@ -120,6 +122,14 @@ class LlamaCppEngine(InferenceEngine):
 
             deadline = time.monotonic() + float(os.getenv("LLAMA_SERVER_START_TIMEOUT", "120"))
             while time.monotonic() < deadline:
+                if self._proc.returncode is not None:
+                    code = self._proc.returncode
+                    err = await self._drain_stderr_tail()
+                    await self._stop_locked()
+                    raise RuntimeError(
+                        f"llama-server exited during startup code={code}. "
+                        f"stderr_tail={err!r}"
+                    )
                 health = await self.health()
                 if health.status:
                     logger.info("llama-server ready | url={}", self.base_url)
@@ -127,22 +137,26 @@ class LlamaCppEngine(InferenceEngine):
                 await asyncio.sleep(0.3)
 
             err = await self._drain_stderr_tail()
-            await self.stop()
+            await self._stop_locked()
             raise RuntimeError(f"llama-server did not become healthy in time. stderr_tail={err!r}")
 
     async def stop(self) -> None:
         """Terminate the subprocess and close the HTTP client."""
         async with self._lock:
-            if self._http:
-                await self._http.aclose()
-                self._http = None
-            if self._proc and self._proc.returncode is None:
-                self._proc.terminate()
-                try:
-                    await asyncio.wait_for(self._proc.wait(), timeout=15.0)
-                except TimeoutError:
-                    self._proc.kill()
-            self._proc = None
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
+        """Stop backend resources while ``self._lock`` is already held."""
+        if self._http:
+            await self._http.aclose()
+            self._http = None
+        if self._proc and self._proc.returncode is None:
+            self._proc.terminate()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=15.0)
+            except TimeoutError:
+                self._proc.kill()
+        self._proc = None
 
     async def _drain_stderr_tail(self, max_bytes: int = 4000) -> str:
         if not self._proc or not self._proc.stderr:

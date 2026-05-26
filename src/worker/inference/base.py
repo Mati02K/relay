@@ -24,6 +24,10 @@ class InferenceEngine(ABC):
     """Data-plane inference backend."""
 
     @abstractmethod
+    async def start(self) -> None:
+        """Ensure the inference backend is ready to accept generation requests."""
+
+    @abstractmethod
     def generate(self, request: Mapping[str, object]) -> AsyncIterator[str]:
         """Stream one chat completion as newline-delimited SSE ``data:`` lines (OpenAI style)."""
 

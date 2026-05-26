@@ -112,10 +112,18 @@ function updateStats() {
 }
 
 function isWorkerHealthy(worker) {
+  if (!isInferenceReady(worker)) return false;
   const tele = worker.telemetry || {};
   if ((tele.theta_w || 0) > 0) return false;
   if ((tele.mw || 0) > 0.95) return false;
   return true;
+}
+
+function isInferenceReady(worker) {
+  if (worker.healthy === false) return false;
+  const engine = worker.health?.engine || worker.health?.body?.engine || worker.engine;
+  if (!engine) return worker.healthy === true;
+  return engine.status === true;
 }
 
 function renderWorkers() {
@@ -136,17 +144,21 @@ function renderWorkerCard(worker) {
   const card = document.createElement("div");
   card.className = "worker-card";
 
-  const stateLevel = (tele.theta_w || 0) > 0
+  const inferenceReady = isInferenceReady(worker);
+  const stateLevel = !inferenceReady
+    ? "danger"
+    : (tele.theta_w || 0) > 0
     ? "danger"
     : (tele.mw || 0) > 0.85
     ? "warn"
     : "healthy";
+  const stateLabel = !inferenceReady ? "unhealthy" : stateLevel;
 
   const head = document.createElement("div");
   head.className = "worker-card-head";
   head.innerHTML = `
     <span class="worker-id">${escapeHtml(worker.node_id)}</span>
-    <span class="worker-state ${stateLevel}">${stateLevel}</span>
+    <span class="worker-state ${stateLevel}">${stateLabel}</span>
   `;
   card.appendChild(head);
 
@@ -154,6 +166,13 @@ function renderWorkerCard(worker) {
   meta.className = "worker-meta";
   meta.textContent = worker.address || "(no address)";
   card.appendChild(meta);
+
+  if (!inferenceReady) {
+    const detail = document.createElement("div");
+    detail.className = "worker-health-detail";
+    detail.textContent = healthDetail(worker);
+    card.appendChild(detail);
+  }
 
   const bars = document.createElement("div");
   bars.className = "worker-bars";
@@ -164,6 +183,11 @@ function renderWorkerCard(worker) {
   card.appendChild(bars);
 
   return card;
+}
+
+function healthDetail(worker) {
+  const engine = worker.health?.engine || worker.health?.body?.engine || {};
+  return engine.detail || worker.health?.detail || "inference engine unavailable";
 }
 
 function makeBar(label, value, max, suffix = "") {

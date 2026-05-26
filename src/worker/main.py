@@ -50,7 +50,11 @@ async def logRequests(request: Request, callNext: object) -> Response:
 @app.get("/health")
 async def health(request: Request) -> dict[str, Any]:
     """Return worker daemon and inference engine health."""
-    return await _worker(request).health()
+    payload = await _worker(request).health()
+    engine = payload.get("engine")
+    if not isinstance(engine, dict) or engine.get("status") is not True:
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
 
 
 @app.get("/telemetry")
@@ -62,8 +66,13 @@ async def telemetry(request: Request) -> dict[str, Any]:
 @app.post("/v1/chat/completions")
 async def chatCompletions(request: Request) -> StreamingResponse:
     """Run an OpenAI-compatible chat completion request scheduled by the coordinator."""
+    worker = _worker(request)
     body = await request.json()
+    try:
+        await worker.ensure_ready()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     return StreamingResponse(
-        _worker(request).generate(body),
+        worker.generate(body),
         media_type="text/event-stream",
     )

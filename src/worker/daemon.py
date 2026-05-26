@@ -92,6 +92,10 @@ class WorkerDaemon:
         automatically if this process crashes or loses the network. See
         :meth:`MembershipLayer.holdLease` for the contract.
         """
+        models = _worker_models()
+        if models:
+            await self.ensure_ready()
+
         telemetry = await self.telemetry.snapshot()
         metadata = {
             "role": "worker",
@@ -99,7 +103,7 @@ class WorkerDaemon:
             "address": self.address,
             "engine": "llama.cpp",
             "engines": _worker_engines(),
-            "models": _worker_models(),
+            "models": models,
             "prefix_cache": telemetry.prefix_cache.model_dump(),
         }
         await self.membership.holdLease(WORKER_LEASE_TTL_SECONDS)
@@ -130,11 +134,15 @@ class WorkerDaemon:
         """Return worker and engine health."""
         engine_health = await self.inference_engine.health()
         return {
-            "status": "ok",
+            "status": "ok" if engine_health.status else "unhealthy",
             "nodeId": self.node_id,
             "address": self.address,
             "engine": engine_health.model_dump(),
         }
+
+    async def ensure_ready(self) -> None:
+        """Start the inference engine and fail before this worker advertises readiness."""
+        await self.inference_engine.start()
 
     async def telemetry_snapshot(self) -> dict[str, Any]:
         """Return the latest local telemetry snapshot."""

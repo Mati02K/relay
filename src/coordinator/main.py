@@ -25,6 +25,7 @@ NODE_ID: str = os.getenv("NODE_ID", "coordinator")
 COORDINATOR_PORT: int = int(os.getenv("COORDINATOR_PORT", "8080"))
 ACTIVE_COORDINATOR_KEY: str = "/relay/active-coordinator"
 SCHEDULE_MAX_ATTEMPTS: int = max(1, int(os.getenv("RELAY_SCHEDULE_MAX_ATTEMPTS", "3")))
+WORKER_HEALTH_TIMEOUT_SECONDS: float = float(os.getenv("RELAY_WORKER_HEALTH_TIMEOUT", "2.0"))
 
 membershipClient: EtcdMembership | None = None
 jitterProbe: JitterProbe | None = None
@@ -180,11 +181,12 @@ async def chatCompletions(request: Request) -> StreamingResponse:
             measured = jitterProbe.get_jitter_ms(worker.node_id)
             if measured is not None:
                 worker.telemetry.jw = measured
+    ready_workers = await _ready_worker_snapshots(workers)
 
     try:
         choice, opened, attempts = await _open_stream_with_retry(
             body,
-            workers,
+            ready_workers,
             lambda worker: _openWorkerStream(worker, body),
             SCHEDULE_MAX_ATTEMPTS,
         )
@@ -235,7 +237,7 @@ async def listModels() -> dict[str, Any]:
     """
     _requireActive()
     assert membershipClient is not None
-    workers = await fetch_worker_snapshots(membershipClient)
+    workers = await _ready_worker_snapshots(await fetch_worker_snapshots(membershipClient))
     return {"object": "list", "data": _collect_model_entries(workers)}
 
 
@@ -271,16 +273,121 @@ async def listWorkers() -> list[dict[str, Any]]:
             measured = jitterProbe.get_jitter_ms(worker.node_id)
             if measured is not None:
                 worker.telemetry.jw = measured
+    health_by_node = await _worker_health_states(workers)
     return [
         {
             "node_id": worker.node_id,
             "address": worker.address,
             "models": worker.metadata.get("models", []),
             "engines": worker.metadata.get("engines", []),
+            "healthy": health_by_node.get(worker.node_id, {}).get("healthy", False),
+            "health": health_by_node.get(worker.node_id, _unknown_worker_health()),
             "telemetry": worker.telemetry.model_dump(),
         }
         for worker in workers
     ]
+
+
+async def _ready_worker_snapshots(workers: Sequence[WorkerSnapshot]) -> list[WorkerSnapshot]:
+    """Return workers whose HTTP health reports an active inference engine."""
+    health_by_node = await _worker_health_states(workers)
+    return [
+        worker
+        for worker in workers
+        if health_by_node.get(worker.node_id, {}).get("healthy") is True
+    ]
+
+
+async def _worker_health_states(workers: Sequence[WorkerSnapshot]) -> dict[str, dict[str, Any]]:
+    """Fetch worker health and normalize it for scheduling and dashboards."""
+    if not workers:
+        return {}
+    timeout = httpx.Timeout(WORKER_HEALTH_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        results = await asyncio.gather(
+            *(_worker_health_state(client, worker) for worker in workers),
+            return_exceptions=True,
+        )
+    health_by_node: dict[str, dict[str, Any]] = {}
+    for worker, result in zip(workers, results, strict=False):
+        if isinstance(result, Exception):
+            logger.warning(
+                "Skipping unhealthy worker | worker={} address={} error={}",
+                worker.node_id,
+                worker.address,
+                result,
+            )
+            health_by_node[worker.node_id] = _unknown_worker_health(str(result))
+        else:
+            health_by_node[worker.node_id] = result
+    return health_by_node
+
+
+async def _worker_health_state(
+    client: httpx.AsyncClient,
+    worker: WorkerSnapshot,
+) -> dict[str, Any]:
+    """Return normalized health for one worker."""
+    try:
+        response = await client.get(f"{worker.address}/health")
+    except httpx.RequestError as e:
+        logger.warning(
+            "Skipping unreachable worker | worker={} address={} error={}",
+            worker.node_id,
+            worker.address,
+            e,
+        )
+        return _unknown_worker_health(str(e))
+
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.warning("Skipping worker with invalid health JSON | worker={}", worker.node_id)
+        return _unknown_worker_health("invalid health JSON", status_code=response.status_code)
+
+    if not isinstance(payload, dict):
+        return _unknown_worker_health("invalid health payload", status_code=response.status_code)
+
+    body = payload.get("detail") if response.status_code >= 400 else payload
+    if not isinstance(body, dict):
+        body = payload
+    engine = body.get("engine") if isinstance(body, dict) else None
+    if not isinstance(engine, dict) or engine.get("status") is not True:
+        detail = engine.get("detail") if isinstance(engine, dict) else "missing engine health"
+        logger.warning(
+            "Skipping worker with inactive engine | worker={} detail={}",
+            worker.node_id,
+            detail,
+        )
+        return {
+            "healthy": False,
+            "status_code": response.status_code,
+            "detail": detail,
+            "engine": engine if isinstance(engine, dict) else _unknown_engine_health(detail),
+            "body": body,
+        }
+    return {
+        "healthy": response.status_code == 200,
+        "status_code": response.status_code,
+        "detail": "ok" if response.status_code == 200 else response.text[:200],
+        "engine": engine,
+        "body": body,
+    }
+
+
+def _unknown_worker_health(detail: str = "unknown", status_code: int | None = None) -> dict[str, Any]:
+    """Return a normalized unhealthy worker health payload."""
+    return {
+        "healthy": False,
+        "status_code": status_code,
+        "detail": detail,
+        "engine": _unknown_engine_health(detail),
+        "body": {},
+    }
+
+
+def _unknown_engine_health(detail: str) -> dict[str, Any]:
+    return {"status": False, "detail": detail, "engine": "unknown"}
 
 
 @app.get("/v1/messages", response_model=dict[str, Any])

@@ -275,6 +275,14 @@ body {
   word-break: break-all;
 }
 
+.worker-health-detail {
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.35;
+  margin: -2px 0 8px;
+  word-break: break-word;
+}
+
 .worker-bars {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
