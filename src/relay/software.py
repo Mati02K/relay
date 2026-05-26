@@ -188,6 +188,12 @@ def ensure_membership_etcd() -> str:
     env["GOMODCACHE"] = str(paths.cache / "go-mod")
     env["GOCACHE"] = str(paths.cache / "go-build")
     env["GOTOOLCHAIN"] = "local"
+    # Force module mode regardless of what the user's shell has set.
+    # GO111MODULE=off (or a stale GOPATH environment) causes Go to resolve
+    # module-local imports against the stdlib tree, producing errors like
+    # "package relay/membership-etcd/membership is not in std".
+    env["GO111MODULE"] = "on"
+    env["GOFLAGS"] = ""
     download = subprocess.run(
         [go_bin, "mod", "download"],
         cwd=build_dir,
