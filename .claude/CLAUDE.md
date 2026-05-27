@@ -12,10 +12,10 @@ Also read:
 
 ## Project Summary
 
-Relay is an experimental distributed LLM serving system for consumer/home
-machines. Clients call an OpenAI-compatible coordinator endpoint. The
-coordinator reads worker metadata and telemetry, chooses one worker for the
-request, forwards the request, and streams the response back to the client.
+Relay is an experimental Control Plane for Edge LLM Serving. Clients call an
+OpenAI-compatible coordinator endpoint. The coordinator reads worker metadata
+and telemetry, chooses one worker for the request, forwards the request, and
+streams the response back to the client.
 
 Relay currently uses data-parallel serving:
 
@@ -96,20 +96,22 @@ Before changing scheduling behavior, read `Scheduling_in_D_Edge_Serving.pdf`.
 The scheduler must stay aligned with the paper-style cost formula:
 
 ```text
-queue_weight * q_w / s_w(b)
+queue_weight * q_w
 + prefix_miss_weight * (1 - overlap(w, r))
 + memory_weight * m_w
 + jitter_weight * j_w / j_max
 + thermal_weight * theta_w
+- worker_weight(w)
 ```
 
 Current implementation:
 
 - `q_w` comes from engine queue/load telemetry.
-- `s_w(b)` comes from `sw_by_bucket`, decode speed by prompt bucket.
 - `overlap(w, r)` comes from prefix-cache hash comparison.
+- `worker_weight(w)` is a per-worker preference advertised in worker metadata (default `0.0`, range `[-1.0, 1.0]`). Configurable at `relay init` via `--worker-weight` or interactive prompt; persisted under `config.worker.weight`.
 - `m_w` comes from engine memory/KV pressure telemetry.
-- `j_w` and `theta_w` exist in schema but real collectors are not implemented yet.
+- `j_w` is measured coordinator-side via periodic `/health` RTT probes (see `src/telemetry/jitter.py`).
+- `theta_w` comes from per-platform thermal collectors aggregated into a single normalized pressure (see `src/telemetry/thermal/`).
 - `j_max` is computed from eligible workers with an environment fallback.
 
 Do not replace this with an unrelated latency heuristic without explicitly
@@ -117,8 +119,6 @@ discussing it first.
 
 ## Current Limitations
 
-- Real jitter collector is not implemented.
-- Real thermal collector is not implemented.
 - Tailscale install/auth is not automated.
 - LAN peer discovery is not implemented.
 - vLLM backend is not implemented.

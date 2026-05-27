@@ -18,7 +18,10 @@ from telemetry.thermal.base import (
 )
 from telemetry.thermal.factory import detect_thermal_collectors
 from telemetry.thermal.linux import LinuxCpuThrottleCollector
-from telemetry.thermal.nvidia import is_thermal_throttle
+from telemetry.thermal.nvidia import (
+    is_thermal_throttle,
+    is_thermal_throttle_corroborated,
+)
 from telemetry.thermal.windows import (
     parse_powershell_temperatures,
     temperatures_to_theta_w,
@@ -41,7 +44,6 @@ class _StubCollector:
                 device_type="cpu",
                 pressure=pressure,
                 state="normal",
-                confidence=1.0,
             )
         ]
 
@@ -72,7 +74,6 @@ class _TypedStubCollector:
                 device_type=self._device_type,
                 pressure=self._pressure,
                 state="normal",
-                confidence=1.0,
             )
         ]
 
@@ -325,6 +326,36 @@ def test_pressure_from_temperature_at_or_above_limit_saturates() -> None:
 )
 def test_nvidia_bit_decoder(reasons_bits: int, expected: int) -> None:
     assert is_thermal_throttle(reasons_bits) == expected
+
+
+def test_corroborated_hw_thermal_always_trusted() -> None:
+    # HW thermal bit set: always treated as throttling regardless of temp.
+    assert is_thermal_throttle_corroborated(0x40, temperature_c=30.0, limit_c=90.0) is True
+    assert is_thermal_throttle_corroborated(0x40, temperature_c=None, limit_c=None) is True
+
+
+def test_corroborated_sw_thermal_ignored_when_cool() -> None:
+    # SW thermal bit set on a cool GPU: must NOT be treated as throttling.
+    assert is_thermal_throttle_corroborated(0x20, temperature_c=52.0, limit_c=87.0) is False
+
+
+def test_corroborated_sw_thermal_trusted_near_limit() -> None:
+    # SW thermal bit set with temp within 10°C of limit: treat as throttling.
+    assert is_thermal_throttle_corroborated(0x20, temperature_c=80.0, limit_c=87.0) is True
+    assert is_thermal_throttle_corroborated(0x20, temperature_c=77.0, limit_c=87.0) is True
+
+
+def test_corroborated_sw_thermal_ignored_without_temp_data() -> None:
+    # SW bit set but no temperature/limit readings: cannot corroborate -> False.
+    assert is_thermal_throttle_corroborated(0x20, temperature_c=None, limit_c=87.0) is False
+    assert is_thermal_throttle_corroborated(0x20, temperature_c=80.0, limit_c=None) is False
+
+
+def test_corroborated_no_thermal_bits_returns_false() -> None:
+    # Other bits (idle, power cap, sync boost) never count as thermal.
+    assert is_thermal_throttle_corroborated(0x0, temperature_c=80.0, limit_c=87.0) is False
+    assert is_thermal_throttle_corroborated(0x4, temperature_c=80.0, limit_c=87.0) is False
+    assert is_thermal_throttle_corroborated(0x10, temperature_c=80.0, limit_c=87.0) is False
 
 
 def test_macos_thermal_state_parser_handles_each_bucket() -> None:

@@ -73,7 +73,6 @@ class AmdGpuSysfsCollector:
                         device_type="gpu",
                         pressure=pressure,
                         state=pressure_to_state(pressure),
-                        confidence=0.75,
                         temperature_c=temp_c,
                         limit_c=limit_c or 100.0,
                         throttle_active=pressure >= 0.65,

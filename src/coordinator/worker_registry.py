@@ -114,7 +114,6 @@ def _default_telemetry(metadata: dict[str, Any]) -> Telemetry:
 def _telemetry_with_prefix(prefix_cache: PrefixCacheTelemetry) -> Telemetry:
     return Telemetry.from_parts(
         request=RequestComputedTelemetry(
-            sw_by_bucket={},
             prefix_cache=prefix_cache,
             sprefill_tokens_per_sec=0.0,
         )

@@ -28,7 +28,6 @@ class ThermalSourceSample:
     device_type: str
     pressure: float
     state: str
-    confidence: float
     temperature_c: float | None = None
     limit_c: float | None = None
     throttle_active: bool | None = None
@@ -41,7 +40,6 @@ class ThermalSourceSample:
             device_type=self.device_type,
             pressure=clamp01(self.pressure),
             state=self.state,
-            confidence=clamp01(self.confidence),
             temperature_c=self.temperature_c,
             limit_c=self.limit_c,
             throttle_active=self.throttle_active,
@@ -57,7 +55,6 @@ class ThermalSnapshot:
     state: str
     cpu_pressure: float
     gpu_pressure: float
-    confidence: float
     sources: list[ThermalSourceSample]
 
     @property
@@ -93,7 +90,6 @@ class NullThermalCollector:
                 device_type="system",
                 pressure=0.0,
                 state=THERMAL_STATE_UNKNOWN,
-                confidence=0.0,
             )
         ]
 
@@ -137,12 +133,11 @@ class ThermalAggregator:
                 sample = value.normalized()
                 logger.debug(
                     "Thermal source sample | source={} device={} pressure={:.3f} "
-                    "state={} confidence={:.2f} tempC={} limitC={} throttled={} details={}",
+                    "state={} tempC={} limitC={} throttled={} details={}",
                     sample.source,
                     sample.device_type,
                     sample.pressure,
                     sample.state,
-                    sample.confidence,
                     sample.temperature_c,
                     sample.limit_c,
                     sample.throttle_active,
@@ -152,12 +147,11 @@ class ThermalAggregator:
         snapshot = aggregate_thermal_samples(samples, primary_device=self._primary_device)
         logger.debug(
             "Thermal aggregate sample | pressure={:.3f} state={} cpu={:.3f} "
-            "gpu={:.3f} confidence={:.2f} collectors={}",
+            "gpu={:.3f} collectors={}",
             snapshot.pressure,
             snapshot.state,
             snapshot.cpu_pressure,
             snapshot.gpu_pressure,
-            snapshot.confidence,
             self.collector_names,
         )
         return snapshot
@@ -184,7 +178,6 @@ def aggregate_thermal_samples(
             state=THERMAL_STATE_UNKNOWN,
             cpu_pressure=0.0,
             gpu_pressure=0.0,
-            confidence=0.0,
             sources=[],
         )
 
@@ -196,21 +189,19 @@ def aggregate_thermal_samples(
         (sample.pressure for sample in normalized if sample.device_type == "gpu"),
         default=0.0,
     )
-    has_gpu = any(sample.device_type == "gpu" and sample.confidence > 0 for sample in normalized)
-    has_cpu = any(sample.device_type == "cpu" and sample.confidence > 0 for sample in normalized)
+    has_gpu = any(sample.device_type == "gpu" for sample in normalized)
+    has_cpu = any(sample.device_type == "cpu" for sample in normalized)
     if primary_device == "gpu" and has_gpu:
         pressure = max(gpu_pressure, cpu_pressure * 0.35)
     elif primary_device == "cpu" and has_cpu:
         pressure = max(cpu_pressure, gpu_pressure * 0.50)
     else:
         pressure = max((sample.pressure for sample in normalized), default=0.0)
-    confidence = max((sample.confidence for sample in normalized), default=0.0)
     return ThermalSnapshot(
         pressure=pressure,
         state=pressure_to_state(pressure),
         cpu_pressure=cpu_pressure,
         gpu_pressure=gpu_pressure,
-        confidence=confidence,
         sources=normalized,
     )
 

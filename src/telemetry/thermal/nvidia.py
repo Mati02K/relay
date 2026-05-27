@@ -44,17 +44,53 @@ _REASON_HW_THERMAL_SLOWDOWN = 0x0000000000000040
 
 _THERMAL_REASON_MASK = _REASON_SW_THERMAL_SLOWDOWN | _REASON_HW_THERMAL_SLOWDOWN
 
+# Laptop drivers assert SW_THERMAL_SLOWDOWN as part of routine power management
+# even when the GPU is idle and cool, so the bit alone is unreliable. Require
+# the temperature to be within this margin of the trip limit before treating
+# a SW slowdown as a real thermal event.
+_SW_THERMAL_CORROBORATION_MARGIN_C = 10.0
+
 
 def is_thermal_throttle(reason_bits: int) -> int:
     """Return 1 if the NVML reason bitmask carries any thermal slowdown flag."""
     return 1 if (reason_bits & _THERMAL_REASON_MASK) else 0
 
 
+def is_hw_thermal_throttle(reason_bits: int) -> bool:
+    """Return True if NVML's HW thermal slowdown bit is set."""
+    return bool(reason_bits & _REASON_HW_THERMAL_SLOWDOWN)
+
+
+def is_sw_thermal_throttle(reason_bits: int) -> bool:
+    """Return True if NVML's SW thermal slowdown bit is set."""
+    return bool(reason_bits & _REASON_SW_THERMAL_SLOWDOWN)
+
+
+def is_thermal_throttle_corroborated(
+    reason_bits: int,
+    temperature_c: float | None,
+    limit_c: float | None,
+) -> bool:
+    """Decide whether a slowdown bit reflects genuine thermal throttling.
+
+    HW thermal slowdown is always trusted. SW thermal slowdown is only trusted
+    when ``temperature_c`` is within ``_SW_THERMAL_CORROBORATION_MARGIN_C`` of
+    ``limit_c`` — laptop drivers raise the SW bit for routine power management
+    even at idle temperatures.
+    """
+    if is_hw_thermal_throttle(reason_bits):
+        return True
+    if not is_sw_thermal_throttle(reason_bits):
+        return False
+    if temperature_c is None or limit_c is None:
+        return False
+    return temperature_c >= limit_c - _SW_THERMAL_CORROBORATION_MARGIN_C
+
+
 class _NvmlClient(Protocol):
     """Small backend interface shared by pynvml and direct-ctypes NVML."""
 
     name: str
-    confidence: float
 
     def device_count(self) -> int:
         """Return visible GPU count."""
@@ -128,18 +164,23 @@ class NvidiaNvmlCollector:
             reasons = self._client.throttle_reason_bits(index)
             temp_c = self._client.temperature_c(index)
             limit_c = self._client.thermal_limit_c(index)
-            thermal_throttle = bool(is_thermal_throttle(reasons or 0))
+            reason_bits = reasons or 0
+            hw_throttle = is_hw_thermal_throttle(reason_bits)
+            sw_throttle = is_sw_thermal_throttle(reason_bits)
+            thermal_throttle = is_thermal_throttle_corroborated(reason_bits, temp_c, limit_c)
             temp_pressure = pressure_from_temperature(temp_c, limit_c)
             pressure = max(temp_pressure, 0.85 if thermal_throttle else 0.0)
             logger.debug(
-                "NVIDIA NVML | backend={} index={} name={} tempC={} "
-                "limitC={} reasonBits={} thermalThrottle={} pressure={:.3f}",
+                "NVIDIA NVML | backend={} index={} name={} tempC={} limitC={} "
+                "reasonBits={} hwThrottle={} swThrottle={} thermalThrottle={} pressure={:.3f}",
                 self.name,
                 index,
                 name,
                 temp_c,
                 limit_c,
-                reasons,
+                reason_bits,
+                hw_throttle,
+                sw_throttle,
                 thermal_throttle,
                 pressure,
             )
@@ -149,7 +190,6 @@ class NvidiaNvmlCollector:
                     device_type="gpu",
                     pressure=pressure,
                     state=pressure_to_state(pressure),
-                    confidence=self._client.confidence,
                     temperature_c=temp_c,
                     limit_c=limit_c,
                     throttle_active=thermal_throttle,
@@ -175,7 +215,6 @@ class _PynvmlClient:
     """NVML client using the ``pynvml`` module from ``nvidia-ml-py``."""
 
     name = "nvidia-nvml"
-    confidence = 0.95
 
     def __init__(self, pynvml: Any) -> None:
         self._pynvml = pynvml
@@ -278,7 +317,6 @@ class _CtypesNvmlClient:
     """NVML client using ``ctypes`` against the local NVIDIA driver library."""
 
     name = "nvidia-nvml-ctypes"
-    confidence = 0.90
 
     def __init__(self, nvml: Any, handles: list[ctypes.c_void_p]) -> None:
         self._nvml = nvml

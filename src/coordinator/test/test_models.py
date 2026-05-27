@@ -70,7 +70,6 @@ def _worker_with_models(node_id: str, models: list[dict[str, object]]) -> Worker
 def _worker_with_metadata(metadata: dict[str, object], node_id: str = "node") -> WorkerSnapshot:
     telemetry = Telemetry(
         qw=0,
-        sw_by_bucket={},
         mw=0.0,
         jw=0.0,
         theta_w=0,

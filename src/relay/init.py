@@ -42,6 +42,7 @@ class InitOptions:
     model: str | None
     model_path: str | None
     skip_model: bool
+    worker_weight: float | None = None
 
 
 def run_init(options: InitOptions) -> RelayConfig:
@@ -70,12 +71,17 @@ def run_init(options: InitOptions) -> RelayConfig:
         membership_host = host
 
     prompted_node_id = options.node_id or _prompt_text("Node id", default=None, required=False)
+    worker_weight = _select_worker_weight(role, options.worker_weight)
     config_kwargs: dict[str, object] = {
         "role": role,
         "network": NetworkConfig(backend=network),
         "membership": MembershipConfig(host=membership_host),
         "coordinator": CoordinatorConfig(host=host),
-        "worker": WorkerConfig(host=host, coordinator_url=coordinator_url),
+        "worker": WorkerConfig(
+            host=host,
+            coordinator_url=coordinator_url,
+            weight=worker_weight,
+        ),
         "engine": EngineConfig(),
     }
     if prompted_node_id:
@@ -234,6 +240,35 @@ def _prompt_float(label: str, *, default: float) -> float:
             continue
         if value < 0.0 or value > 1.0:
             print(f"Weight must be between 0.0 and 1.0 (got {value}). Try again.")
+            continue
+        return value
+
+
+def _select_worker_weight(role: NodeRole, flag_value: float | None) -> float:
+    """Resolve worker-weight from the CLI flag or interactive prompt.
+
+    Only meaningful for nodes that run a worker. Coordinator-only nodes skip
+    the prompt and store the default 0.0 (unused by the scheduler).
+    """
+    if role == "coordinator":
+        return 0.0
+    if flag_value is not None:
+        if not -1.0 <= flag_value <= 1.0:
+            raise ConfigError(
+                f"worker-weight must be between -1.0 and 1.0 (got {flag_value})"
+            )
+        return flag_value
+    while True:
+        raw = input("Worker weight (scheduler preference) [0.0]: ").strip()
+        if not raw:
+            return 0.0
+        try:
+            value = float(raw)
+        except ValueError:
+            print(f"Invalid number: {raw!r}. Try again.")
+            continue
+        if value < -1.0 or value > 1.0:
+            print(f"Worker weight must be between -1.0 and 1.0 (got {value}). Try again.")
             continue
         return value
 

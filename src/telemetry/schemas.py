@@ -111,13 +111,6 @@ class RequestComputedTelemetry(BaseModel):
 
     model_config = {"frozen": True}
 
-    sw_by_bucket: dict[str, float] = Field(
-        default_factory=dict,
-        description=(
-            "Recent decode speed in output tokens/sec, grouped by prompt-length bucket "
-            "such as '<=256' or '<=1024'"
-        ),
-    )
     prefix_cache: PrefixCacheTelemetry = Field(
         default_factory=lambda: PrefixCacheTelemetry.from_config(PrefixHashConfig.from_env(), []),
         description="Recent prefix-cache block hashes published by this worker",
@@ -140,12 +133,6 @@ class ThermalSourceTelemetry(BaseModel):
     device_type: str = Field(..., description="cpu, gpu, system, or unknown")
     pressure: float = Field(0.0, ge=0.0, le=1.0, description="Source pressure in [0, 1]")
     state: str = Field("unknown", description="normal, warm, throttling, critical, or unknown")
-    confidence: float = Field(
-        0.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence that this source reflects actual thermal performance",
-    )
     temperature_c: float | None = Field(None, description="Current temperature if available")
     limit_c: float | None = Field(None, description="Thermal limit/threshold if available")
     throttle_active: bool | None = Field(None, description="Whether source reports throttling")
@@ -161,7 +148,6 @@ class ThermalTelemetry(BaseModel):
     state: str = Field("unknown", description="normal, warm, throttling, critical, or unknown")
     cpu_pressure: float = Field(0.0, ge=0.0, le=1.0, description="CPU thermal pressure")
     gpu_pressure: float = Field(0.0, ge=0.0, le=1.0, description="GPU thermal pressure")
-    confidence: float = Field(0.0, ge=0.0, le=1.0, description="Best source confidence")
     sources: list[ThermalSourceTelemetry] = Field(
         default_factory=list,
         description="Per-source thermal samples used to compute pressure",
@@ -175,7 +161,6 @@ def default_thermal_telemetry() -> ThermalTelemetry:
         state="unknown",
         cpu_pressure=0.0,
         gpu_pressure=0.0,
-        confidence=0.0,
         sources=[],
     )
 
@@ -217,13 +202,6 @@ class Telemetry(BaseModel):
     qw: int = Field(
         0,
         description="Current engine queue/load; engine-provided when available, otherwise 0",
-    )
-    sw_by_bucket: dict[str, float] = Field(
-        default_factory=dict,
-        description=(
-            "Recent decode speed in output tokens/sec, grouped by prompt-length bucket "
-            "such as '<=256' or '<=1024'"
-        ),
     )
     mw: float = Field(
         0.0,
@@ -272,14 +250,12 @@ class Telemetry(BaseModel):
         """Merge telemetry from backend, request, and system sources."""
         engine = engine or EngineReportedTelemetry(qw=0, mw=0.0)
         request = request or RequestComputedTelemetry(
-            sw_by_bucket={},
             prefix_cache=PrefixCacheTelemetry.from_config(PrefixHashConfig.from_env(), []),
             sprefill_tokens_per_sec=0.0,
         )
         system = system or SystemTelemetry(jw=0.0, theta_w=0)
         return cls(
             qw=engine.qw,
-            sw_by_bucket=dict(request.sw_by_bucket),
             mw=engine.mw,
             jw=system.jw,
             theta_w=system.theta_w,

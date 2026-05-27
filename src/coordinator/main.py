@@ -281,6 +281,8 @@ async def listWorkers() -> list[dict[str, Any]]:
             "address": worker.address,
             "models": worker.metadata.get("models", []),
             "engines": worker.metadata.get("engines", []),
+            "weight": worker.metadata.get("weight", 0.0),
+            "weight_override": scheduler_module.WORKER_WEIGHT_OVERRIDES.get(worker.node_id),
             "healthy": health_by_node.get(worker.node_id, {}).get("healthy", False),
             "health": health_by_node.get(worker.node_id, _unknown_worker_health()),
             "telemetry": worker.telemetry.model_dump(),
@@ -332,6 +334,51 @@ async def setSchedulerWeights(payload: dict[str, float]) -> dict[str, float]:
         scheduler_module.WEIGHTS.update(**updates)
         logger.info("Scheduler weights updated | {}", updates)
     return scheduler_module.WEIGHTS.as_dict()
+
+
+@app.get("/v1/scheduler/worker_weights")
+async def getWorkerWeightOverrides() -> dict[str, float]:
+    """Return the active per-worker preference overrides keyed by node id."""
+    _requireActive()
+    return dict(scheduler_module.WORKER_WEIGHT_OVERRIDES)
+
+
+@app.post("/v1/scheduler/worker_weights")
+async def setWorkerWeightOverrides(payload: dict[str, Any]) -> dict[str, float]:
+    """Replace one or more per-worker preference overrides without a restart.
+
+    Accepts a partial JSON object keyed by node id. Each value must be a number
+    in ``[-1.0, 1.0]`` or ``null`` to clear the override for that worker.
+    Returns the post-update override map.
+    """
+    _requireActive()
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Body must be a JSON object of node_id -> weight",
+        )
+    for node_id, raw_value in payload.items():
+        if not isinstance(node_id, str) or not node_id:
+            raise HTTPException(status_code=400, detail=f"Invalid node id: {node_id!r}")
+        if raw_value is None:
+            scheduler_module.WORKER_WEIGHT_OVERRIDES.pop(node_id, None)
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Weight for '{node_id}' must be a number (got {raw_value!r})",
+            ) from e
+        if not -1.0 <= value <= 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Weight for '{node_id}' must be between -1.0 and 1.0 (got {value})",
+            )
+        scheduler_module.WORKER_WEIGHT_OVERRIDES[node_id] = value
+    overrides = dict(scheduler_module.WORKER_WEIGHT_OVERRIDES)
+    logger.info("Worker weight overrides updated | {}", overrides)
+    return overrides
 
 
 async def _ready_worker_snapshots(workers: Sequence[WorkerSnapshot]) -> list[WorkerSnapshot]:

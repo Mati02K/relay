@@ -3,14 +3,17 @@
 The coordinator uses this module to choose one worker for each incoming
 OpenAI-style request. The scheduler follows the paper-style cost function:
 
-``queue_weight * q_w / s_w(b)
+``queue_weight * q_w
 + prefix_miss_weight * (1 - overlap(w, r))
 + memory_weight * m_w
 + jitter_weight * j_w / j_max
-+ thermal_weight * theta_w``
++ thermal_weight * theta_w
+- worker_weight(w)``
 
-Lower cost is better. All weights are configurable through environment
-variables so the scheduler can be tuned without changing code.
+Lower cost is better. The five global weights are configurable through
+environment variables so the scheduler can be tuned without changing code.
+``worker_weight(w)`` is a per-worker preference advertised by each worker in
+its metadata; default ``0.0`` makes it inert.
 """
 
 from __future__ import annotations
@@ -26,10 +29,7 @@ from telemetry.prefix_cache import (
     prefix_hit_tokens,
     request_to_prefix_text,
 )
-from telemetry.request_metrics import prompt_length_bucket_id
-from telemetry.schemas import Telemetry
 
-DEFAULT_DECODE_TOKENS_PER_SEC = float(os.getenv("RELAY_DEFAULT_DECODE_TOKENS_PER_SEC", "10"))
 DEFAULT_JITTER_MAX_MS = float(os.getenv("RELAY_SCHED_JITTER_MAX_MS", "1.0"))
 
 
@@ -80,6 +80,14 @@ class SchedulerWeights:
 # Live, mutable weights. Reads in `_score_worker` go through this object so
 # `.update(...)` from the API changes scheduling on the very next request.
 WEIGHTS = SchedulerWeights.from_env()
+
+# Live, in-memory overrides for per-worker preference. Keyed by node id.
+# The worker's metadata still carries the baseline weight set at init; this
+# map lets operators temporarily boost or penalise specific workers from the
+# dashboard without re-running ``relay init`` or restarting the worker. The
+# override is not persisted across coordinator restarts by design — it's a
+# tuning knob, not configuration.
+WORKER_WEIGHT_OVERRIDES: dict[str, float] = {}
 
 
 class SchedulingError(RuntimeError):
@@ -154,18 +162,17 @@ def _score_worker(
     uncached_prompt_tokens = max(0, prompt_tokens - matched_tokens)
     overlap = _prefix_overlap(matched_tokens, prompt_tokens)
 
-    bucket = prompt_length_bucket_id(prompt_tokens)
-    decode_speed = _decode_speed(telemetry, bucket)
     weights = WEIGHTS
-    queue_term = weights.queue * telemetry.qw / decode_speed
+    queue_term = weights.queue * telemetry.qw
     prefix_term = weights.prefix_miss * (1.0 - overlap)
     memory_term = weights.memory * telemetry.mw
     jitter_term = weights.jitter * telemetry.jw / jitter_max
     thermal_term = weights.thermal * telemetry.theta_w
+    worker_weight = _worker_weight(worker)
 
     return WorkerChoice(
         worker=worker,
-        cost=queue_term + prefix_term + memory_term + jitter_term + thermal_term,
+        cost=queue_term + prefix_term + memory_term + jitter_term + thermal_term - worker_weight,
         matched_blocks=matched_blocks,
         matched_tokens=matched_tokens,
         prompt_tokens=prompt_tokens,
@@ -174,20 +181,19 @@ def _score_worker(
     )
 
 
-def _decode_speed(telemetry: Telemetry, bucket: str) -> float:
-    """Return decode speed for a prompt-length bucket with fallback behavior.
+def _worker_weight(worker: WorkerSnapshot) -> float:
+    """Return the worker's effective preference, clamped to ``[-1.0, 1.0]``.
 
-    Prefer the speed observed for this request's prompt bucket. If that bucket
-    has no data yet, use the best observed decode speed from any bucket. If this
-    worker has no request history, use the default decode speed.
+    Live coordinator overrides win over the worker's advertised metadata so
+    dashboard tweaks take effect on the next request without a restart.
     """
-    bucket_speed = telemetry.sw_by_bucket.get(bucket)
-    if bucket_speed is not None and bucket_speed > 0:
-        return bucket_speed
-    observed_speeds = [speed for speed in telemetry.sw_by_bucket.values() if speed > 0]
-    if observed_speeds:
-        return max(observed_speeds)
-    return max(DEFAULT_DECODE_TOKENS_PER_SEC, 1e-6)
+    override = WORKER_WEIGHT_OVERRIDES.get(worker.node_id)
+    raw = override if override is not None else worker.metadata.get("weight", 0.0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-1.0, min(1.0, value))
 
 
 def _prefix_overlap(matched_tokens: int, prompt_tokens: int) -> float:

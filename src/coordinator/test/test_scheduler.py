@@ -10,8 +10,8 @@ from telemetry.schemas import PrefixCacheTelemetry, Telemetry
 
 def test_choose_worker_prefers_lower_queue_over_equal_workers() -> None:
     request = _request("Explain Relay scheduling in one sentence.")
-    slow_queue = _worker("busy", qw=20, decode_speed=10.0)
-    low_queue = _worker("idle", qw=1, decode_speed=10.0)
+    slow_queue = _worker("busy", qw=20)
+    low_queue = _worker("idle", qw=1)
 
     choice = choose_worker(request, [slow_queue, low_queue])
 
@@ -24,11 +24,10 @@ def test_choose_worker_prefers_longer_prefix_overlap_when_load_is_equal() -> Non
     prompt_text = request_to_prefix_text(request)
     prefix = compute_prefix_hashes_from_text(prompt_text)
 
-    cold = _worker("cold", qw=0, decode_speed=10.0)
+    cold = _worker("cold", qw=0)
     warm = _worker(
         "warm",
         qw=0,
-        decode_speed=10.0,
         prefix_cache=PrefixCacheTelemetry.from_config(prefix.config, prefix.block_hashes),
     )
 
@@ -37,6 +36,38 @@ def test_choose_worker_prefers_longer_prefix_overlap_when_load_is_equal() -> Non
     assert choice.worker.node_id == "warm"
     assert choice.overlap > 0.9
     assert choice.uncached_prompt_tokens == choice.prompt_tokens - choice.matched_tokens
+
+
+def test_choose_worker_positive_weight_flips_tied_workers() -> None:
+    request = _request("hello")
+    plain = _worker("plain", qw=5)
+    preferred = _worker("preferred", qw=5, weight=0.5)
+
+    choice = choose_worker(request, [plain, preferred])
+
+    assert choice.worker.node_id == "preferred"
+
+
+def test_choose_worker_negative_weight_deprioritizes() -> None:
+    request = _request("hello")
+    plain = _worker("plain", qw=5)
+    penalised = _worker("penalised", qw=5, weight=-0.5)
+
+    choice = choose_worker(request, [plain, penalised])
+
+    assert choice.worker.node_id == "plain"
+
+
+def test_choose_worker_weight_clamped_at_boundaries() -> None:
+    request = _request("hello")
+    # qw differs by 2; out-of-range weight 5.0 would otherwise flip the choice,
+    # but clamping caps the bonus at 1.0, so the lower-queue worker still wins.
+    busy_preferred = _worker("busy", qw=5, weight=5.0)
+    idle_plain = _worker("idle", qw=3)
+
+    choice = choose_worker(request, [busy_preferred, idle_plain])
+
+    assert choice.worker.node_id == "idle"
 
 
 def _request(content: str) -> dict[str, object]:
@@ -50,12 +81,11 @@ def _worker(
     node_id: str,
     *,
     qw: int,
-    decode_speed: float,
     prefix_cache: PrefixCacheTelemetry | None = None,
+    weight: float = 0.0,
 ) -> WorkerSnapshot:
     telemetry = Telemetry(
         qw=qw,
-        sw_by_bucket={"<=256": decode_speed, "<=1024": decode_speed},
         mw=0.0,
         jw=0.0,
         theta_w=0,
@@ -72,7 +102,8 @@ def _worker(
                     "id": "test-model",
                     "loaded": True,
                 }
-            ]
+            ],
+            "weight": weight,
         },
         telemetry=telemetry,
     )

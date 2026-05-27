@@ -208,6 +208,7 @@ def build_process_specs(config: RelayConfig | None, paths: RelayPaths) -> list[M
         worker_env = common_env.copy()
         worker_env["WORKER_HOST"] = config.worker.host
         worker_env["WORKER_PORT"] = str(config.worker.port)
+        worker_env["WORKER_WEIGHT"] = str(config.worker.weight)
         worker_env["RELAY_MODEL_ID"] = model.id
         worker_env["LLAMA_MODEL_ID"] = model.id
         worker_env["LLAMA_MODEL_PATH"] = model.path

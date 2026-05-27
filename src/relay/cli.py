@@ -49,6 +49,11 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--model", help="catalog model id to pull")
     init_parser.add_argument("--model-path", help="local GGUF model path")
     init_parser.add_argument("--skip-model", action="store_true")
+    init_parser.add_argument(
+        "--worker-weight",
+        type=float,
+        help="per-worker scheduler preference in [-1.0, 1.0]; default 0.0 (no effect)",
+    )
     init_parser.set_defaults(func=_cmd_init)
 
     start_parser = sub.add_parser("start", help="start configured Relay processes")
@@ -130,6 +135,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
             model=args.model,
             model_path=args.model_path,
             skip_model=bool(args.skip_model),
+            worker_weight=args.worker_weight,
         )
     )
     print(f"{ok('config:')} {RelayPaths.from_home().config}")

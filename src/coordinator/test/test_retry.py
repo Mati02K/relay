@@ -131,7 +131,6 @@ def _request() -> dict[str, object]:
 def _worker(node_id: str, *, qw: int) -> WorkerSnapshot:
     telemetry = Telemetry(
         qw=qw,
-        sw_by_bucket={"<=256": 10.0, "<=1024": 10.0},
         mw=0.0,
         jw=0.0,
         theta_w=0,

@@ -87,6 +87,7 @@ class WorkerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 9090
     coordinator_url: str | None = None
+    weight: float = Field(default=0.0, ge=-1.0, le=1.0)
 
 
 class EngineConfig(BaseModel):

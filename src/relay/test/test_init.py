@@ -19,8 +19,8 @@ def test_interactive_pull_accepts_numbered_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RELAY_HOME", str(tmp_path))
-    # Inputs in order: model setup choice, model number, scheduler choice.
-    inputs = iter(["pull", "1", "default"])
+    # Inputs in order: worker weight, model setup choice, model number, scheduler choice.
+    inputs = iter(["", "pull", "1", "default"])
 
     def fake_input(prompt: str) -> str:
         return next(inputs)

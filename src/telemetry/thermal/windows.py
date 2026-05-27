@@ -133,7 +133,6 @@ class WindowsCpuThermalCollector:
                     device_type="system",
                     pressure=pressure,
                     state=pressure_to_state(pressure),
-                    confidence=0.60,
                     temperature_c=temp_c,
                     limit_c=self._threshold_celsius,
                     throttle_active=temp_c >= self._threshold_celsius,

@@ -124,7 +124,6 @@ class MacOSThermalStateCollector:
                 device_type="system",
                 pressure=pressure,
                 state=thermal_state_to_label(parsed),
-                confidence=0.90,
                 throttle_active=parsed >= _THROTTLE_THRESHOLD,
                 details={"raw_state": parsed},
             )

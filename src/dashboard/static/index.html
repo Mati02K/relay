@@ -144,9 +144,22 @@
             <!-- five sliders rendered by app.js -->
           </div>
 
-          <footer class="settings-foot">
-            <div id="apply-status" class="apply-status"></div>
-          </footer>
+          <header class="settings-head" style="margin-top: 24px;">
+            <div>
+              <div class="settings-title">Worker preferences</div>
+              <div class="settings-sub">
+                Per-worker override that subtracts from the cost. Range
+                <code>[-1.0, 1.0]</code> — positive boosts the worker, negative deprioritises it,
+                0 falls back to the worker's advertised baseline.
+              </div>
+            </div>
+          </header>
+
+          <div class="weights-grid" id="worker-weights-grid">
+            <div class="empty">Loading worker weights…</div>
+          </div>
+
+          <div id="apply-status" class="apply-status" hidden></div>
         </div>
       </div>
     </main>

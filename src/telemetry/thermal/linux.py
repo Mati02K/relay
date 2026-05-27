@@ -118,14 +118,12 @@ class LinuxCpuThrottleCollector:
                 throttle_pressure,
                 pressure,
             )
-        confidence = 0.85 if total is not None else 0.55 if temp.temperature_c is not None else 0.0
         return [
             ThermalSourceSample(
                 source=self.name,
                 device_type="cpu",
                 pressure=pressure,
                 state=pressure_to_state(pressure),
-                confidence=confidence,
                 temperature_c=temp.temperature_c,
                 limit_c=temp.limit_c,
                 throttle_active=throttle_active,

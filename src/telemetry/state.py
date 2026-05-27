@@ -44,19 +44,14 @@ class WorkerTelemetryState:
         self,
         *,
         prompt_context: PromptTelemetryContext,
-        elapsed_seconds: float,
         first_token_seconds: float | None,
         prompt_tokens: int,
-        completion_tokens: int,
     ) -> None:
         """Update request-computed telemetry from one completed generation."""
         async with self._lock:
             self._request_tracker.observe_completion(
-                bucket=prompt_context.bucket,
-                elapsed_seconds=elapsed_seconds,
                 first_token_seconds=first_token_seconds,
                 prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
                 prefix_hashes=prompt_context.prefix_hashes,
             )
 

@@ -11,6 +11,7 @@
 // the settings view only fetches when first opened.
 
 const WORKER_POLL_INTERVAL_MS = 3000;
+const PREFILL_HISTORY_LENGTH = 60;
 
 const state = {
   view: "map",
@@ -21,7 +22,10 @@ const state = {
   weights: null,
   weightsBaseline: null,
   weightsDirty: false,
+  workerWeights: null,
+  workerWeightsBaseline: null,
   drawerWorkerId: null,
+  prefillHistory: new Map(),
 };
 
 const el = {};
@@ -75,6 +79,7 @@ function cacheElements() {
 
   // Settings view
   el.weightsGrid = document.getElementById("weights-grid");
+  el.workerWeightsGrid = document.getElementById("worker-weights-grid");
   el.applyBtn = document.getElementById("apply-btn");
   el.resetBtn = document.getElementById("reset-btn");
   el.applyStatus = document.getElementById("apply-status");
@@ -116,8 +121,9 @@ function switchView(name) {
   el.settingsBtn.classList.toggle("active", name === "settings");
   // Footer hint is only relevant in the chat view.
   el.footerHint.hidden = name !== "chat";
-  if (name === "settings" && state.weights === null) {
-    fetchWeights();
+  if (name === "settings") {
+    if (state.weights === null) fetchWeights();
+    fetchWorkerWeights();
   }
   if (name === "map") {
     // Re-render the map so layout fills the now-visible canvas.
@@ -154,10 +160,14 @@ async function refreshWorkers() {
     }
     state.workers = await res.json();
     setConnection("healthy", "connected");
+    recordPrefillHistory();
     updateStats();
     updateModelSelect();
     renderMap();
     refreshDrawerIfOpen();
+    if (state.view === "settings" && state.workerWeights !== null) {
+      renderWorkerWeights();
+    }
   } catch (e) {
     setConnection("danger", "unreachable");
   }
@@ -376,6 +386,61 @@ function cap(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+// ============================ Prefill speed history ============================
+
+function recordPrefillHistory() {
+  const liveIds = new Set();
+  for (const worker of state.workers) {
+    liveIds.add(worker.node_id);
+    const value = Number(worker.telemetry?.sprefill_tokens_per_sec ?? 0);
+    let history = state.prefillHistory.get(worker.node_id);
+    if (!history) {
+      history = [];
+      state.prefillHistory.set(worker.node_id, history);
+    }
+    history.push(value);
+    if (history.length > PREFILL_HISTORY_LENGTH) {
+      history.splice(0, history.length - PREFILL_HISTORY_LENGTH);
+    }
+  }
+  for (const nodeId of state.prefillHistory.keys()) {
+    if (!liveIds.has(nodeId)) state.prefillHistory.delete(nodeId);
+  }
+}
+
+function renderPrefillSparkline(nodeId) {
+  const history = state.prefillHistory.get(nodeId) || [];
+  if (history.length < 2) {
+    return '<div class="sparkline-empty">collecting samples…</div>';
+  }
+  const w = 220;
+  const h = 56;
+  const padY = 6;
+  const maxObserved = Math.max(...history);
+  const minObserved = Math.min(...history);
+  // Pad the visible range so flat lines don't pin to the top edge, and small
+  // fluctuations on small absolute values still register visually.
+  const rangeFloor = Math.max(maxObserved * 0.15, 5);
+  const yMax = maxObserved + rangeFloor;
+  const yMin = Math.max(0, minObserved - rangeFloor);
+  const span = Math.max(yMax - yMin, 1);
+  const stepX = w / (PREFILL_HISTORY_LENGTH - 1);
+  const offsetX = w - (history.length - 1) * stepX;
+  const coords = history.map((value, idx) => {
+    const x = offsetX + idx * stepX;
+    const y = h - padY - ((value - yMin) / span) * (h - 2 * padY);
+    return { x, y };
+  });
+  const linePoints = coords.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  const fillPoints = `${coords[0].x.toFixed(1)},${(h - padY).toFixed(1)} ${linePoints} ${coords[coords.length - 1].x.toFixed(1)},${(h - padY).toFixed(1)}`;
+  return `
+    <svg class="sparkline" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      <polygon class="sparkline-fill" points="${fillPoints}" />
+      <polyline class="sparkline-line" points="${linePoints}" />
+    </svg>
+  `;
+}
+
 // ============================ Worker detail drawer ============================
 
 function wireDrawer() {
@@ -420,6 +485,7 @@ function refreshDrawerIfOpen() {
         <dt>state</dt><dd class="state-${level}">${level}</dd>
         <dt>engine</dt><dd>${escapeHtml(engine)} (${escapeHtml(engineDetail)})</dd>
         <dt>http</dt><dd>${escapeHtml(String(worker.health?.status_code ?? "—"))}</dd>
+        <dt>worker weight</dt><dd>${Number(worker.weight ?? 0).toFixed(2)}</dd>
       </dl>
     </div>
     <div class="drawer-section">
@@ -433,6 +499,13 @@ function refreshDrawerIfOpen() {
         <dt>cpu pressure</dt><dd>${Number(thermal.cpu_pressure ?? 0).toFixed(2)}</dd>
         <dt>gpu pressure</dt><dd>${Number(thermal.gpu_pressure ?? 0).toFixed(2)}</dd>
       </dl>
+    </div>
+    <div class="drawer-section">
+      <div class="drawer-section-title">Prefill speed</div>
+      <dl class="drawer-kv">
+        <dt>current</dt><dd>${Number(tele.sprefill_tokens_per_sec ?? 0).toFixed(1)} tok/s</dd>
+      </dl>
+      ${renderPrefillSparkline(worker.node_id)}
     </div>
     <div class="drawer-section">
       <div class="drawer-section-title">Models</div>
@@ -472,13 +545,17 @@ const WEIGHT_FIELDS = [
 ];
 
 function wireSettings() {
-  el.applyBtn.addEventListener("click", applyWeights);
+  el.applyBtn.addEventListener("click", applyAllWeights);
   el.resetBtn.addEventListener("click", () => {
     if (state.weightsBaseline) {
       state.weights = { ...state.weightsBaseline };
       renderWeights();
-      markWeightsDirty(false);
     }
+    if (state.workerWeightsBaseline) {
+      state.workerWeights = { ...state.workerWeightsBaseline };
+      renderWorkerWeights();
+    }
+    markWeightsDirty(false);
   });
 }
 
@@ -529,10 +606,28 @@ function renderWeights() {
 }
 
 function detectDirty() {
-  if (!state.weights || !state.weightsBaseline) return false;
-  return WEIGHT_FIELDS.some(
-    (f) => (state.weights[f.key] ?? 0) !== (state.weightsBaseline[f.key] ?? 0),
-  );
+  const weightsDirty =
+    !!state.weights &&
+    !!state.weightsBaseline &&
+    WEIGHT_FIELDS.some(
+      (f) => (state.weights[f.key] ?? 0) !== (state.weightsBaseline[f.key] ?? 0),
+    );
+  const workerDirty =
+    !!state.workerWeights &&
+    !!state.workerWeightsBaseline &&
+    (() => {
+      const keys = new Set([
+        ...Object.keys(state.workerWeights),
+        ...Object.keys(state.workerWeightsBaseline),
+      ]);
+      for (const key of keys) {
+        if ((state.workerWeights[key] ?? null) !== (state.workerWeightsBaseline[key] ?? null)) {
+          return true;
+        }
+      }
+      return false;
+    })();
+  return weightsDirty || workerDirty;
 }
 
 function markWeightsDirty(dirty) {
@@ -540,35 +635,148 @@ function markWeightsDirty(dirty) {
   el.applyBtn.disabled = !dirty;
 }
 
-async function applyWeights() {
+async function fetchWorkerWeights() {
+  try {
+    const res = await fetch("/api/scheduler/worker_weights");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const weights = await res.json();
+    state.workerWeights = { ...weights };
+    state.workerWeightsBaseline = { ...weights };
+    renderWorkerWeights();
+    markWeightsDirty(detectDirty());
+  } catch (e) {
+    setApplyStatus(`Failed to load worker weights: ${e.message || e}`, "error");
+  }
+}
+
+function renderWorkerWeights() {
+  if (!el.workerWeightsGrid) return;
+  const workers = state.workers || [];
+  if (workers.length === 0) {
+    el.workerWeightsGrid.innerHTML = '<div class="empty">No workers registered.</div>';
+    return;
+  }
+  if (state.workerWeights === null) {
+    el.workerWeightsGrid.innerHTML = '<div class="empty">Loading worker weights…</div>';
+    return;
+  }
+  el.workerWeightsGrid.innerHTML = "";
+  for (const worker of workers) {
+    const nodeId = worker.node_id;
+    const baseline = Number(worker.weight ?? 0);
+    const override = state.workerWeights[nodeId];
+    const effective = override !== undefined && override !== null ? Number(override) : baseline;
+    const card = document.createElement("div");
+    card.className = "weight-card";
+    card.innerHTML = `
+      <div class="weight-head">
+        <span class="weight-label">${escapeHtml(nodeId)}</span>
+        <span class="weight-value" data-bind="${escapeHtml(nodeId)}-num">${effective.toFixed(2)}</span>
+      </div>
+      <input type="range" min="-1" max="1" step="0.01" value="${effective}" data-bind="${escapeHtml(nodeId)}-range" />
+    `;
+    el.workerWeightsGrid.appendChild(card);
+    const range = card.querySelector(`input[data-bind='${cssEscape(nodeId)}-range']`);
+    const numEl = card.querySelector(`[data-bind='${cssEscape(nodeId)}-num']`);
+    range.addEventListener("input", () => {
+      const v = clampRange(parseFloat(range.value), -1, 1);
+      // 0 clears the override so the baseline takes over again.
+      if (v === 0) {
+        delete state.workerWeights[nodeId];
+      } else {
+        state.workerWeights[nodeId] = v;
+      }
+      numEl.textContent = v.toFixed(2);
+      markWeightsDirty(detectDirty());
+    });
+  }
+}
+
+function cssEscape(value) {
+  if (window.CSS && CSS.escape) return CSS.escape(value);
+  return String(value).replace(/['"\\]/g, "\\$&");
+}
+
+function clampRange(v, lo, hi) {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(lo, Math.min(hi, v));
+}
+
+async function applyAllWeights() {
   if (!state.weightsDirty) return;
   setApplyStatus("applying…", "neutral");
   el.applyBtn.disabled = true;
   try {
-    const res = await fetch("/api/scheduler/weights", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.weights),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text.slice(0, 200) || `HTTP ${res.status}`);
+    const [w1, w2] = await Promise.all([applySchedulerWeights(), applyWorkerWeightOverrides()]);
+    if (w1) {
+      state.weights = w1;
+      state.weightsBaseline = { ...w1 };
+      renderWeights();
     }
-    const applied = await res.json();
-    state.weights = applied;
-    state.weightsBaseline = { ...applied };
-    renderWeights();
+    if (w2 !== null) {
+      state.workerWeights = { ...w2 };
+      state.workerWeightsBaseline = { ...w2 };
+      renderWorkerWeights();
+    }
     markWeightsDirty(false);
-    setApplyStatus("applied. Scheduler now using new weights.", "success");
+    setApplyStatus("applied. Scheduler now using new values.", "success");
   } catch (e) {
     setApplyStatus(`Apply failed: ${e.message || e}`, "error");
     markWeightsDirty(true);
   }
 }
 
+async function applySchedulerWeights() {
+  if (!state.weights || !state.weightsBaseline) return null;
+  const dirty = WEIGHT_FIELDS.some(
+    (f) => (state.weights[f.key] ?? 0) !== (state.weightsBaseline[f.key] ?? 0),
+  );
+  if (!dirty) return null;
+  const res = await fetch("/api/scheduler/weights", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state.weights),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.slice(0, 200) || `HTTP ${res.status}`);
+  }
+  return await res.json();
+}
+
+async function applyWorkerWeightOverrides() {
+  if (!state.workerWeights || !state.workerWeightsBaseline) return null;
+  // Build a diff payload: changed keys -> value, removed keys -> null.
+  const payload = {};
+  const keys = new Set([
+    ...Object.keys(state.workerWeights),
+    ...Object.keys(state.workerWeightsBaseline),
+  ]);
+  let dirty = false;
+  for (const key of keys) {
+    const current = state.workerWeights[key];
+    const baseline = state.workerWeightsBaseline[key];
+    if ((current ?? null) === (baseline ?? null)) continue;
+    payload[key] = current === undefined ? null : current;
+    dirty = true;
+  }
+  if (!dirty) return null;
+  const res = await fetch("/api/scheduler/worker_weights", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.slice(0, 200) || `HTTP ${res.status}`);
+  }
+  return await res.json();
+}
+
 function setApplyStatus(text, level) {
   el.applyStatus.textContent = text;
   el.applyStatus.className = `apply-status apply-${level}`;
+  el.applyStatus.hidden = !text;
 }
 
 function clamp01(v) {

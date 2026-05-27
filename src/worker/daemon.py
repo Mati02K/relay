@@ -15,7 +15,7 @@ from loguru import logger
 from membership.base import MembershipLayer
 from membership.etcd import EtcdMembership
 from network.tailscale import TailscaleNetwork
-from telemetry.request_metrics import extract_usage_token_counts
+from telemetry.request_metrics import extract_usage_prompt_tokens
 from telemetry.schemas import SystemTelemetry, ThermalSourceTelemetry, ThermalTelemetry
 from telemetry.state import WorkerTelemetryState
 from telemetry.thermal import ThermalAggregator, detect_thermal_collectors
@@ -47,11 +47,13 @@ class WorkerDaemon:
         thermal: ThermalAggregator | None = None,
         telemetry_interval_seconds: float = TELEMETRY_INTERVAL_SECONDS,
         thermal_interval_seconds: float = THERMAL_INTERVAL_SECONDS,
+        weight: float = 0.0,
     ) -> None:
         self.node_id = node_id
         self.address = address
         self.membership = membership
         self.inference_engine = inference_engine
+        self.weight = max(-1.0, min(1.0, float(weight)))
         self.telemetry = telemetry or WorkerTelemetryState()
         self.thermal = thermal or ThermalAggregator(
             detect_thermal_collectors(uses_gpu=inference_engine.uses_gpu),
@@ -79,11 +81,17 @@ class WorkerDaemon:
         # Currently only support for llamacpp
         inference_engine = LlamaCppEngine()
 
+        try:
+            weight = float(os.getenv("WORKER_WEIGHT", "0"))
+        except ValueError:
+            weight = 0.0
+
         return cls(
             node_id=node_id,
             address=address,
             membership=membership,
             inference_engine=inference_engine,
+            weight=weight,
         )
 
     async def start(self) -> None:
@@ -106,6 +114,7 @@ class WorkerDaemon:
             "engines": _worker_engines(),
             "models": models,
             "prefix_cache": telemetry.prefix_cache.model_dump(),
+            "weight": self.weight,
         }
         await self.membership.holdLease(WORKER_LEASE_TTL_SECONDS)
         await self.membership.register(self.node_id, metadata)
@@ -163,30 +172,23 @@ class WorkerDaemon:
         t0 = time.perf_counter()
         first_token_t: float | None = None
         last_usage_prompt: int | None = None
-        last_usage_completion: int | None = None
 
         async for line in self.inference_engine.generate(body):
             if first_token_t is None and _line_has_content_delta(line):
                 first_token_t = time.perf_counter()
-            pt, ct = _usage_from_sse_line(line)
+            pt = _usage_prompt_tokens_from_sse_line(line)
             if pt is not None:
                 last_usage_prompt = pt
-            if ct is not None:
-                last_usage_completion = ct
             yield line
 
-        elapsed = time.perf_counter() - t0
         prompt_tokens = (
             last_usage_prompt if last_usage_prompt is not None else prompt_context.estimated_tokens
         )
-        completion_tokens = last_usage_completion if last_usage_completion is not None else 0
         first_token_seconds = first_token_t - t0 if first_token_t is not None else None
         await self.telemetry.observe_request_completion(
             prompt_context=prompt_context,
-            elapsed_seconds=elapsed,
             first_token_seconds=first_token_seconds,
             prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
         )
 
     async def _publish_telemetry_loop(self) -> None:
@@ -232,13 +234,13 @@ class WorkerDaemon:
         return f"{WORKER_METADATA_KEY_PREFIX}/{self.node_id}/telemetry"
 
 
-def _usage_from_sse_line(line: str) -> tuple[int | None, int | None]:
+def _usage_prompt_tokens_from_sse_line(line: str) -> int | None:
     if not line.startswith("data: "):
-        return None, None
+        return None
     payload = line.removeprefix("data: ").strip()
     if not payload or payload == "[DONE]":
-        return None, None
-    return extract_usage_token_counts(payload)
+        return None
+    return extract_usage_prompt_tokens(payload)
 
 
 def _line_has_content_delta(line: str) -> bool:
@@ -312,14 +314,12 @@ def _thermal_snapshot_to_schema(snapshot: Any) -> ThermalTelemetry:
         state=snapshot.state,
         cpu_pressure=snapshot.cpu_pressure,
         gpu_pressure=snapshot.gpu_pressure,
-        confidence=snapshot.confidence,
         sources=[
             ThermalSourceTelemetry(
                 source=source.source,
                 device_type=source.device_type,
                 pressure=source.pressure,
                 state=source.state,
-                confidence=source.confidence,
                 temperature_c=source.temperature_c,
                 limit_c=source.limit_c,
                 throttle_active=source.throttle_active,
