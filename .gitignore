@@ -18,7 +18,6 @@ build/
 # Generated gRPC stubs — regenerate with `make proto`
 src/membership/relay_pb2.py
 src/membership/relay_pb2_grpc.py
-src/membership/etcd-go/membership/
 
 # Model files
 *.gguf

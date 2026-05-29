@@ -378,9 +378,19 @@ def _pid_matches_spec(pid: int, spec: ManagedProcess) -> bool:
 def _process_cmdline(pid: int) -> str:
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return raw.replace(b"\x00", b" ").decode(errors="replace")
     except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
         return ""
-    return raw.replace(b"\x00", b" ").decode(errors="replace")
 
 
 def _wait_for_tcp(host: str, port: int, name: str) -> None:
