@@ -4,9 +4,11 @@ NVML is the NVIDIA driver API used for GPU telemetry. Relay prefers the
 ``pynvml`` module from the ``nvidia-ml-py`` package, and falls back to loading
 ``libnvidia-ml.so.1`` directly with ``ctypes`` when that package is missing.
 
-The collector reads GPU temperature, thermal limits, and NVML clock-event
-reason bits. Only thermal slowdown bits are treated as throttling; idle
-downclocking and power caps are not heat-driven and are ignored here.
+Pressure is derived entirely from the temperature curve in
+:func:`telemetry.thermal.base.pressure_from_temperature`. NVML's clock-event
+reason bits are intentionally not consulted: on consumer laptop GPUs the
+software thermal-slowdown bit fires for routine power management even when
+the chip is cool, and the cleaner story is to trust temperature alone.
 """
 
 from __future__ import annotations
@@ -30,61 +32,9 @@ NVML_TEMPERATURE_GPU = 0
 NVML_TEMPERATURE_THRESHOLD_SHUTDOWN = 0
 NVML_TEMPERATURE_THRESHOLD_SLOWDOWN = 1
 
-# Bit values from nvml.h. Keeping them local lets this module import even when
-# no NVIDIA driver or Python NVML package exists.
-#
-# Note: NVML also exposes a generic HW_SLOWDOWN bit (0x8) which is set when
-# any hardware slowdown is engaged — including power brake and sync boost,
-# both of which fire for non-thermal reasons on consumer/laptop GPUs. We
-# intentionally exclude it from the thermal mask to avoid false-positive
-# throttling alerts on idle systems. Only the two specifically-thermal
-# bits below qualify.
-_REASON_SW_THERMAL_SLOWDOWN = 0x0000000000000020
-_REASON_HW_THERMAL_SLOWDOWN = 0x0000000000000040
-
-_THERMAL_REASON_MASK = _REASON_SW_THERMAL_SLOWDOWN | _REASON_HW_THERMAL_SLOWDOWN
-
-# Laptop drivers assert SW_THERMAL_SLOWDOWN as part of routine power management
-# even when the GPU is idle and cool, so the bit alone is unreliable. Require
-# the temperature to be within this margin of the trip limit before treating
-# a SW slowdown as a real thermal event.
-_SW_THERMAL_CORROBORATION_MARGIN_C = 10.0
-
-
-def is_thermal_throttle(reason_bits: int) -> int:
-    """Return 1 if the NVML reason bitmask carries any thermal slowdown flag."""
-    return 1 if (reason_bits & _THERMAL_REASON_MASK) else 0
-
-
-def is_hw_thermal_throttle(reason_bits: int) -> bool:
-    """Return True if NVML's HW thermal slowdown bit is set."""
-    return bool(reason_bits & _REASON_HW_THERMAL_SLOWDOWN)
-
-
-def is_sw_thermal_throttle(reason_bits: int) -> bool:
-    """Return True if NVML's SW thermal slowdown bit is set."""
-    return bool(reason_bits & _REASON_SW_THERMAL_SLOWDOWN)
-
-
-def is_thermal_throttle_corroborated(
-    reason_bits: int,
-    temperature_c: float | None,
-    limit_c: float | None,
-) -> bool:
-    """Decide whether a slowdown bit reflects genuine thermal throttling.
-
-    HW thermal slowdown is always trusted. SW thermal slowdown is only trusted
-    when ``temperature_c`` is within ``_SW_THERMAL_CORROBORATION_MARGIN_C`` of
-    ``limit_c`` — laptop drivers raise the SW bit for routine power management
-    even at idle temperatures.
-    """
-    if is_hw_thermal_throttle(reason_bits):
-        return True
-    if not is_sw_thermal_throttle(reason_bits):
-        return False
-    if temperature_c is None or limit_c is None:
-        return False
-    return temperature_c >= limit_c - _SW_THERMAL_CORROBORATION_MARGIN_C
+# A sample whose pressure crosses this threshold is reported as throttling.
+# Matches the "throttling" band in :func:`pressure_to_state`.
+_THROTTLE_ACTIVE_PRESSURE = 0.65
 
 
 class _NvmlClient(Protocol):
@@ -106,10 +56,6 @@ class _NvmlClient(Protocol):
 
     def thermal_limit_c(self, index: int) -> float | None:
         """Return the thermal slowdown/shutdown threshold in Celsius."""
-        ...
-
-    def throttle_reason_bits(self, index: int) -> int | None:
-        """Return NVML current clock-event reason bits."""
         ...
 
     def close(self) -> None:
@@ -161,27 +107,16 @@ class NvidiaNvmlCollector:
         samples: list[ThermalSourceSample] = []
         for index in self._device_indices:
             name = self._client.device_name(index)
-            reasons = self._client.throttle_reason_bits(index)
             temp_c = self._client.temperature_c(index)
             limit_c = self._client.thermal_limit_c(index)
-            reason_bits = reasons or 0
-            hw_throttle = is_hw_thermal_throttle(reason_bits)
-            sw_throttle = is_sw_thermal_throttle(reason_bits)
-            thermal_throttle = is_thermal_throttle_corroborated(reason_bits, temp_c, limit_c)
-            temp_pressure = pressure_from_temperature(temp_c, limit_c)
-            pressure = max(temp_pressure, 0.85 if thermal_throttle else 0.0)
+            pressure = pressure_from_temperature(temp_c, limit_c)
             logger.debug(
-                "NVIDIA NVML | backend={} index={} name={} tempC={} limitC={} "
-                "reasonBits={} hwThrottle={} swThrottle={} thermalThrottle={} pressure={:.3f}",
+                "NVIDIA NVML | backend={} index={} name={} tempC={} limitC={} pressure={:.3f}",
                 self.name,
                 index,
                 name,
                 temp_c,
                 limit_c,
-                reason_bits,
-                hw_throttle,
-                sw_throttle,
-                thermal_throttle,
                 pressure,
             )
             samples.append(
@@ -192,12 +127,8 @@ class NvidiaNvmlCollector:
                     state=pressure_to_state(pressure),
                     temperature_c=temp_c,
                     limit_c=limit_c,
-                    throttle_active=thermal_throttle,
-                    details={
-                        "index": index,
-                        "name": name,
-                        "reason_bits": reasons,
-                    },
+                    throttle_active=pressure >= _THROTTLE_ACTIVE_PRESSURE,
+                    details={"index": index, "name": name},
                 )
             )
         return samples
@@ -284,24 +215,6 @@ class _PynvmlClient:
             except Exception:
                 continue
         return None
-
-    def throttle_reason_bits(self, index: int) -> int | None:
-        getter = getattr(
-            self._pynvml,
-            "nvmlDeviceGetCurrentClocksEventReasons",
-            None,
-        ) or getattr(
-            self._pynvml,
-            "nvmlDeviceGetCurrentClocksThrottleReasons",
-            None,
-        )
-        if getter is None:
-            return None
-        try:
-            return int(getter(self._handle(index)))
-        except Exception as e:
-            logger.debug("pynvml throttle reason read failed | index={} error={}", index, e)
-            return None
 
     def close(self) -> None:
         try:
@@ -410,30 +323,6 @@ class _CtypesNvmlClient:
             if rc == NVML_SUCCESS:
                 return float(value.value)
         return None
-
-    def throttle_reason_bits(self, index: int) -> int | None:
-        fn = _get_nvml_function(
-            self._nvml,
-            "nvmlDeviceGetCurrentClocksEventReasons",
-        ) or _get_nvml_function(
-            self._nvml,
-            "nvmlDeviceGetCurrentClocksThrottleReasons",
-        )
-        if fn is None:
-            return None
-        value = ctypes.c_ulonglong()
-        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong)]
-        fn.restype = ctypes.c_int
-        rc = int(fn(self._handles[index], ctypes.byref(value)))
-        if rc != NVML_SUCCESS:
-            logger.debug(
-                "direct NVML throttle reason read failed | index={} rc={} error={}",
-                index,
-                rc,
-                _nvml_error_string(self._nvml, rc),
-            )
-            return None
-        return int(value.value)
 
     def close(self) -> None:
         _ctypes_shutdown(self._nvml)

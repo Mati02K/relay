@@ -35,3 +35,6 @@ src/membership/etcd-go/membership-etcd
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Local stress / diagnostic scripts
+test/stress_thermal.py

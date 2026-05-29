@@ -1,6 +1,6 @@
 # Relay
 
-Relay is a control plane for OpenAI-compatible LLM serving across a small
+Relay is a experimental control plane for OpenAI-compatible LLM serving across a small
 home, lab, or personal-device cluster. Each worker owns its own inference
 engine and model files. A coordinator receives client requests, reads worker
 telemetry, schedules each request to the best available worker, and streams
@@ -166,6 +166,34 @@ and immediately becomes eligible for scheduling. You can give each worker a
 different model — the coordinator routes requests based on the `model` field in
 the request.
 
+#### Launch the dashboard from this worker (optional)
+
+The dashboard is **not tied to the coordinator host** — any machine that can
+reach the coordinator over the network can launch it, including this worker.
+Useful when you want to inspect the cluster, run a test chat, or tune
+scheduler weights without ssh-ing back to the coordinator machine.
+
+On the worker:
+
+```bash
+relay dashboard --coordinator http://COORD_IP:8080
+```
+
+The browser opens at `http://127.0.0.1:8090` on this machine. From there you
+can see all workers on the live map (including this one), open the test chat,
+or change scheduler weights — every action goes back to the coordinator and is
+reflected cluster-wide.
+
+If `8090` is already in use locally, pass `--port`:
+
+```bash
+relay dashboard --port 8095 --coordinator http://COORD_IP:8080
+```
+
+The dashboard process is supervised — `relay stop` on this worker will stop it
+alongside the worker, and `relay status` will list it. See [Dashboard](#dashboard)
+for the full feature walkthrough.
+
 ---
 
 ## Models
@@ -279,6 +307,16 @@ curl -s http://COORD_IP:8080/v1/workers | python3 -m json.tool
 ```
 
 You should see one entry per registered worker with live telemetry.
+
+**Open the dashboard from any node on the tailnet:**
+
+```bash
+relay dashboard --coordinator http://COORD_IP:8080
+```
+
+Works from the coordinator, any worker, or any other machine on the tailnet —
+it's just an HTTP front-end that proxies to the coordinator. See the
+[Dashboard](#dashboard) section for what each view does.
 
 **Test a chat request:**
 

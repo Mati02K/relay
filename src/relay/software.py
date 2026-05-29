@@ -323,31 +323,87 @@ def _fetch_latest_llama_cpp_release() -> dict[str, Any]:
 
 
 def _select_llama_cpp_asset(release: dict[str, Any]) -> dict[str, str]:
+    """Pick the best llama.cpp release asset for this machine.
+
+    Iterates platform-appropriate candidate fragments in priority order so the
+    first hit is the most powerful build the machine can run — GPU-accelerated
+    when a compatible GPU is detected, CPU as the universal fallback.
+    """
     assets = release.get("assets")
     if not isinstance(assets, list):
         raise RuntimeError("llama.cpp release metadata has no assets")
-    wanted = _llama_cpp_asset_fragment()
-    for asset in assets:
-        if not isinstance(asset, dict):
-            continue
-        name = str(asset.get("name", ""))
-        url = str(asset.get("browser_download_url", ""))
-        if wanted in name and url:
-            return {"name": name, "browser_download_url": url}
-    raise RuntimeError(f"No llama.cpp prebuilt asset matched this machine ({wanted})")
+    candidates = _llama_cpp_asset_candidates()
+    for candidate in candidates:
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name", ""))
+            url = str(asset.get("browser_download_url", ""))
+            if candidate in name and url:
+                return {"name": name, "browser_download_url": url}
+    raise RuntimeError(
+        "No llama.cpp prebuilt asset matched this machine "
+        f"(tried fragments: {', '.join(candidates)})"
+    )
 
 
-def _llama_cpp_asset_fragment() -> str:
+def _llama_cpp_asset_candidates() -> list[str]:
+    """Return release-asset name fragments in priority order, best match first.
+
+    Reflects what upstream llama.cpp actually publishes on each platform:
+
+    * Linux ships no CUDA prebuilt anymore; the Vulkan build is the universal
+      GPU path that works on NVIDIA / AMD / Intel hardware. Prefer it when any
+      GPU is detected, otherwise fall back to the CPU build.
+    * macOS binaries already bundle Metal — a single arch fragment is enough.
+    * Windows still ships native CUDA and HIP builds, plus Vulkan as a vendor-
+      neutral GPU fallback and a CPU build as the universal floor.
+
+    The first fragment that substring-matches a real release asset wins.
+    """
     system = platform.system().lower()
     machine = platform.machine().lower()
     arch = "arm64" if machine in {"aarch64", "arm64"} else "x64"
+    candidates: list[str] = []
     if system == "linux":
-        return f"bin-ubuntu-{arch}.tar.gz"
+        if _has_nvidia_gpu():
+            candidates.append(f"bin-ubuntu-vulkan-{arch}")
+        candidates.append(f"bin-ubuntu-{arch}.tar.gz")
+        return candidates
     if system == "darwin":
-        return f"bin-macos-{arch}.tar.gz"
+        return [f"bin-macos-{arch}.tar.gz"]
     if system == "windows":
-        return f"bin-win-cpu-{arch}.zip"
+        if _has_nvidia_gpu():
+            # Try newest CUDA major first, then any older CUDA, then Vulkan.
+            for cuda_major in ("13", "12"):
+                candidates.append(f"bin-win-cuda-{cuda_major}")
+            candidates.append(f"bin-win-vulkan-{arch}")
+        candidates.append(f"bin-win-cpu-{arch}.zip")
+        return candidates
     raise RuntimeError(f"Unsupported platform for llama.cpp auto-install: {system}/{machine}")
+
+
+def _has_nvidia_gpu() -> bool:
+    """Return ``True`` when ``nvidia-smi -L`` reports at least one visible GPU.
+
+    Used to decide whether to download a CUDA-enabled llama.cpp build. Stays
+    conservative on failure: any exception, missing binary, or empty output
+    means we fall back to CPU rather than risk an install that won't run.
+    """
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        return False
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "-L"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def _llama_server_binary_name() -> str:

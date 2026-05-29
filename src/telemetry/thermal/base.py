@@ -222,7 +222,7 @@ def pressure_from_temperature(
     temperature_c: float | None,
     limit_c: float | None,
     *,
-    warm_margin_c: float = 8.0,
+    warm_margin_c: float = 10.0,
 ) -> float:
     """Convert temperature and limit into normalized pressure.
 
@@ -231,7 +231,7 @@ def pressure_from_temperature(
     warm contributes only modest pressure — only readings close to the
     actual throttle limit ramp the score up.
 
-    The defaults are deliberately conservative: a chip cruising at 88 °C
+    The defaults are deliberately conservative: a chip cruising at 85 °C
     against a 100 °C trip point reads ``0``, because it isn't being
     thermally clocked. Real throttling signals (explicit slowdown bits,
     sysfs counter deltas) dominate this term anyway.
