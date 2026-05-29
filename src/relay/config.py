@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from relay.paths import RelayPaths
 
 NodeRole = Literal["coordinator", "worker", "dual"]
-NetworkBackend = Literal["tailscale", "lan"]
+NetworkBackend = Literal["lan", "tailscale"]
 MembershipBackend = Literal["etcd"]
 EngineName = Literal["llama.cpp"]
 
@@ -26,7 +26,7 @@ class ConfigError(RuntimeError):
 class NetworkConfig(BaseModel):
     """Network backend selected for cluster traffic."""
 
-    backend: NetworkBackend = "tailscale"
+    backend: NetworkBackend = "lan"
 
 
 class MembershipConfig(BaseModel):
@@ -59,19 +59,20 @@ class SchedulerConfig(BaseModel):
     """Per-term weights for the paper-style scheduler cost function.
 
     Each weight scales one signal that contributes to a worker's cost; the
-    scheduler picks the lowest-cost worker. Every weight is constrained to
-    ``[0.0, 1.0]``: ``1.0`` means full influence (the default), ``0.0`` means
-    that signal is ignored, and values in between dampen it. Pydantic
-    enforces the bound, so manual edits to ``config.json`` outside the range
-    will fail validation at load time.
+    scheduler picks the lowest-cost worker. The base 5 weights are bounded
+    to ``[0.0, 1.0]``; ``nu`` (RouteLLM quality term) is bounded to
+    ``[0.0, 50.0]`` because the operating points in SCHEDULER.md use
+    ``nu=5`` and ``nu=20``.
 
-    The five weights map to the cost terms in ``src/coordinator/scheduler.py``:
+    The six weights map to the cost terms in ``src/coordinator/scheduler.py``:
 
     * ``queue``       — punishes deep queues (relative to decode speed).
     * ``prefix_miss`` — punishes prefix-cache misses (rewards cache hits).
     * ``memory``      — punishes KV/RAM pressure on the worker.
     * ``jitter``      — punishes flaky network paths.
     * ``thermal``     — punishes thermally-throttled workers.
+    * ``nu``          — quality-aware routing knob: ``nu * complexity *
+      (1 - quality)``. ``0`` disables it.
     """
 
     queue: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -79,6 +80,10 @@ class SchedulerConfig(BaseModel):
     memory: float = Field(default=1.0, ge=0.0, le=1.0)
     jitter: float = Field(default=1.0, ge=0.0, le=1.0)
     thermal: float = Field(default=1.0, ge=0.0, le=1.0)
+    nu: float = Field(default=0.0, ge=0.0, le=50.0)
+
+
+KNOWN_MODALITIES: tuple[str, ...] = ("text", "image", "audio", "video")
 
 
 class WorkerConfig(BaseModel):
@@ -88,6 +93,8 @@ class WorkerConfig(BaseModel):
     port: int = 9090
     coordinator_url: str | None = None
     weight: float = Field(default=0.0, ge=-1.0, le=1.0)
+    model_quality: float = Field(default=0.5, ge=0.0, le=1.0)
+    modalities: list[str] = Field(default_factory=lambda: ["text"])
 
 
 class EngineConfig(BaseModel):

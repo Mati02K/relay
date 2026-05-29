@@ -1,7 +1,9 @@
 # Relay
 
-Relay is a experimental control plane for OpenAI-compatible LLM serving across a small
-home, lab, or personal-device cluster. Each worker owns its own inference
+**Control Plane for Distributed Edge Inference.**
+
+Relay is an experimental, OpenAI-compatible control plane that runs across a
+small home, lab, or personal-device cluster. Each worker owns its own inference
 engine and model files. A coordinator receives client requests, reads worker
 telemetry, schedules each request to the best available worker, and streams
 the response back to the client.
@@ -238,10 +240,31 @@ relay models list
 
 ## Multi-Machine Setup
 
-### Using Tailscale (recommended)
+### Using LAN (recommended for same-network setups)
 
-Tailscale gives every machine a stable `100.x.y.z` address that works across
-networks without port-forwarding or VPN configuration.
+If every machine sits on the same local network, this is the default and
+simplest backend — no overlay, no extra daemons. Pass each node its LAN IP
+explicitly:
+
+```bash
+# Coordinator
+relay init --role dual --network lan --host 192.168.1.10 --node-id home-server
+
+# Worker
+relay init --role worker --network lan --host 192.168.1.11 \
+    --coordinator http://192.168.1.10:8080 --node-id laptop-worker
+```
+
+You must pass `--host` on each node since LAN auto-discovery (mDNS) is not
+wired into the scheduling path. Workers register through etcd in the usual way.
+
+---
+
+### Using Tailscale (for cross-network / multi-site clusters)
+
+If your machines live on different networks or behind NATs, Tailscale gives
+every machine a stable `100.x.y.z` address that works across networks without
+port-forwarding or VPN configuration.
 
 **Install Tailscale on every machine:**
 
@@ -346,26 +369,6 @@ In Open WebUI → Settings → Connections → OpenAI API → Add Connection:
 - **Base URL:** `http://COORD_IP:8080/v1`
 - **API key:** anything (e.g. `relay`) — not validated
 - The model dropdown auto-populates from `/v1/models`
-
----
-
-### Using LAN (no Tailscale)
-
-If every machine can reach each other on the local network, skip Tailscale and
-pass the LAN IP directly:
-
-```bash
-# Coordinator
-relay init --role dual --network lan --host 192.168.1.10 --node-id home-server
-
-# Worker
-relay init --role worker --network lan --host 192.168.1.11 \
-    --coordinator http://192.168.1.10:8080 --node-id laptop-worker
-```
-
-You must pass `--host` on each node since LAN auto-discovery (mDNS) is not
-wired into the scheduling path. Workers still register through etcd, identical
-to the Tailscale case.
 
 ---
 

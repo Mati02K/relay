@@ -799,6 +799,366 @@ body {
   flex-shrink: 0;
 }
 
+.settings-head-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  backdrop-filter: blur(8px);
+  background: linear-gradient(180deg, rgba(12, 17, 22, 0.96), rgba(12, 17, 22, 0.88));
+}
+
+.settings-head-thin {
+  padding: 12px 18px;
+  margin-top: 4px;
+}
+
+/* ── Top compact knob row (6 cost weights, no scrolling on desktop) ── */
+
+.knob-row {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 880px) {
+  .knob-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+.knob {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+  transition: border-color 0.15s ease, transform 0.15s ease;
+  position: relative;
+}
+
+.knob:hover {
+  border-color: var(--accent-line);
+  transform: translateY(-1px);
+}
+
+.knob.dirty {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.knob-key {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.knob-dial {
+  position: relative;
+  width: 62px;
+  height: 62px;
+}
+
+.knob-dial svg {
+  width: 100%;
+  height: 100%;
+  transform: rotate(-135deg);
+}
+
+.knob-dial-track {
+  stroke: var(--bg-3);
+  stroke-width: 6;
+  fill: none;
+}
+
+.knob-dial-fill {
+  stroke: var(--accent);
+  stroke-width: 6;
+  stroke-linecap: round;
+  fill: none;
+  transition: stroke-dashoffset 0.12s ease;
+  filter: drop-shadow(0 0 4px rgba(245, 176, 33, 0.55));
+}
+
+.knob-dial-value {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  letter-spacing: -0.02em;
+}
+
+.knob input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  background: var(--bg-3);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.knob input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-0);
+  cursor: grab;
+}
+
+.knob input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-0);
+  cursor: grab;
+}
+
+.knob-tooltip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: normal;
+  width: 200px;
+  max-width: 200px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 6;
+}
+
+.knob:hover .knob-tooltip { opacity: 1; }
+
+/* ── Worker table (bottom) ───────────────────────────────────────────── */
+
+.worker-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+  overflow: hidden;
+}
+
+.worker-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.worker-table th,
+.worker-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.worker-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.worker-table thead th {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--bg-2);
+  position: sticky;
+  top: 0;
+}
+
+.th-range {
+  font-size: 9.5px;
+  color: var(--text-dim);
+  margin-left: 4px;
+  letter-spacing: 0.04em;
+}
+
+.worker-table tbody tr:hover {
+  background: rgba(245, 176, 33, 0.04);
+}
+
+.worker-table tbody tr.row-dirty {
+  background: rgba(245, 176, 33, 0.08);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.wt-id { width: 18%; }
+.wt-model { width: 18%; }
+.wt-weight { width: 18%; }
+.wt-quality { width: 18%; }
+.wt-modalities { width: 22%; }
+.wt-actions { width: 6%; text-align: right; }
+
+.wt-id-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wt-id-name {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.wt-id-state {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.wt-id-state.state-healthy { color: var(--healthy); }
+.wt-id-state.state-warn    { color: var(--warn); }
+.wt-id-state.state-danger  { color: var(--danger); }
+
+.wt-model-cell {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.mini-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mini-slider input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 3px;
+  background: var(--bg-3);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  min-width: 60px;
+}
+
+.mini-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-0);
+  cursor: grab;
+}
+
+.mini-slider input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-0);
+  cursor: grab;
+}
+
+.mini-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 11.5px;
+  min-width: 32px;
+  text-align: right;
+}
+
+.mini-value.overridden {
+  color: var(--accent);
+}
+
+.mini-value.baseline {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.modality-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.modality-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-2);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.12s ease;
+}
+
+.modality-chip:hover {
+  border-color: var(--accent-line);
+  color: var(--text);
+}
+
+.modality-chip.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.wt-reset {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.wt-reset:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.wt-reset:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.wt-empty td {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 24px 12px;
+  font-style: italic;
+}
+
+/* Legacy classes still used by Reset button render path — kept for compat. */
+
 .weights-grid {
   display: grid;
   grid-template-columns: 1fr;

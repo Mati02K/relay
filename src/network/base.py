@@ -1,32 +1,15 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-
-
-@dataclass
-class PeerInfo:
-    """Describes a discovered peer device on the network."""
-
-    id: str
-    address: str
-    online: bool
-    name: str
 
 
 class NetworkLayer(ABC):
-    """Abstract interface for peer discovery and address resolution."""
+    """Abstract interface for resolving this node's address on the overlay network.
+
+    Today the only consumer is :meth:`getMyAddress`, used by the worker and
+    coordinator to learn the IP they should advertise into etcd metadata.
+    The class survives as an ABC so different deployment topologies
+    (Tailscale, plain LAN) can plug in without changing call sites.
+    """
 
     @abstractmethod
     def getMyAddress(self) -> str:
         """Return the stable IP address of this device on the overlay network."""
-
-    @abstractmethod
-    def getPeerAddress(self, peerId: str) -> str:
-        """Return the current IP address of a known peer by its device ID."""
-
-    @abstractmethod
-    def discoverPeers(self) -> list[PeerInfo]:
-        """Scan the network and return all currently reachable peers."""
-
-    @abstractmethod
-    def isPeerReachable(self, peerId: str) -> bool:
-        """Return whether the given peer is currently online and reachable."""

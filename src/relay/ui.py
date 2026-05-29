@@ -40,7 +40,7 @@ def style(text: str, *codes: str) -> str:
     return "".join(codes) + text + RESET
 
 
-def banner(subtitle: str = "Control Plane for Edge LLM Serving") -> str:
+def banner(subtitle: str = "Control Plane for Distributed Edge Inference") -> str:
     """Return the ASCII Relay banner with the configured colour."""
     art_lines = (
         " ____  _____ _        _ __   __",

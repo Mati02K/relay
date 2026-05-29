@@ -126,12 +126,12 @@
 
       <div class="settings-body">
         <div class="settings-shell">
-          <header class="settings-head">
+          <header class="settings-head settings-head-sticky">
             <div>
-              <div class="settings-title">Scheduler weights</div>
+              <div class="settings-title">Scheduler cost weights</div>
               <div class="settings-sub">
-                Live. Apply updates the running coordinator with no restart.
-                Each weight is <code>[0.0, 1.0]</code> — 1.0 is full influence, 0 disables the signal.
+                Hot-applied. Six terms add into <code>cost(w, r)</code>; lower wins.
+                Base 5 are <code>[0,1]</code>; <code>nu</code> is <code>[0,50]</code>.
               </div>
             </div>
             <div class="settings-actions">
@@ -140,23 +140,38 @@
             </div>
           </header>
 
-          <div class="weights-grid" id="weights-grid">
-            <!-- five sliders rendered by app.js -->
+          <div class="knob-row" id="weights-grid">
+            <!-- compact dials rendered by app.js -->
           </div>
 
-          <header class="settings-head" style="margin-top: 24px;">
+          <header class="settings-head settings-head-thin">
             <div>
-              <div class="settings-title">Worker preferences</div>
+              <div class="settings-title">Per-worker routing</div>
               <div class="settings-sub">
-                Per-worker override that subtracts from the cost. Range
-                <code>[-1.0, 1.0]</code> — positive boosts the worker, negative deprioritises it,
-                0 falls back to the worker's advertised baseline.
+                One row per registered worker. <code>weight</code> subtracts
+                from the cost, <code>quality</code> drives the <code>nu</code>
+                term, <code>modalities</code> filter eligibility. Empty cell
+                falls back to the worker's advertised baseline.
               </div>
             </div>
           </header>
 
-          <div class="weights-grid" id="worker-weights-grid">
-            <div class="empty">Loading worker weights…</div>
+          <div class="worker-table-wrap">
+            <table class="worker-table" id="worker-table">
+              <thead>
+                <tr>
+                  <th class="wt-id">worker</th>
+                  <th class="wt-model">model</th>
+                  <th class="wt-weight">weight <span class="th-range">[-1, 1]</span></th>
+                  <th class="wt-quality">quality <span class="th-range">[0, 1]</span></th>
+                  <th class="wt-modalities">modalities</th>
+                  <th class="wt-actions"></th>
+                </tr>
+              </thead>
+              <tbody id="worker-table-body">
+                <tr class="wt-empty"><td colspan="6">Loading workers…</td></tr>
+              </tbody>
+            </table>
           </div>
 
           <div id="apply-status" class="apply-status" hidden></div>

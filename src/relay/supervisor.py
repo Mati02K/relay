@@ -164,6 +164,7 @@ def build_process_specs(config: RelayConfig | None, paths: RelayPaths) -> list[M
     common_env["MEMBERSHIP_HOST"] = config.membership.host
     common_env["MEMBERSHIP_PORT"] = str(config.membership.grpc_port)
     common_env["LOG_FILE"] = str(paths.logs / "relay.log")
+    common_env["RELAY_NETWORK_BACKEND"] = config.network.backend
 
     if config.runs_coordinator:
         specs.extend(_membership_process_specs(config, paths, common_env))
@@ -180,6 +181,7 @@ def build_process_specs(config: RelayConfig | None, paths: RelayPaths) -> list[M
         coordinator_env["RELAY_SCHED_MEMORY_WEIGHT"] = str(config.scheduler.memory)
         coordinator_env["RELAY_SCHED_JITTER_WEIGHT"] = str(config.scheduler.jitter)
         coordinator_env["RELAY_SCHED_THERMAL_WEIGHT"] = str(config.scheduler.thermal)
+        coordinator_env["RELAY_SCHED_NU_WEIGHT"] = str(config.scheduler.nu)
         specs.append(
             ManagedProcess(
                 name="coordinator",
@@ -209,6 +211,8 @@ def build_process_specs(config: RelayConfig | None, paths: RelayPaths) -> list[M
         worker_env["WORKER_HOST"] = config.worker.host
         worker_env["WORKER_PORT"] = str(config.worker.port)
         worker_env["WORKER_WEIGHT"] = str(config.worker.weight)
+        worker_env["RELAY_MODEL_QUALITY"] = str(config.worker.model_quality)
+        worker_env["RELAY_MODALITIES"] = ",".join(config.worker.modalities)
         worker_env["RELAY_MODEL_ID"] = model.id
         worker_env["LLAMA_MODEL_ID"] = model.id
         worker_env["LLAMA_MODEL_PATH"] = model.path

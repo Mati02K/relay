@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from coordinator.router import (
     detect_request_modalities,
@@ -107,6 +108,13 @@ WEIGHTS = SchedulerWeights.from_env()
 # tuning knob, not configuration.
 WORKER_WEIGHT_OVERRIDES: dict[str, float] = {}
 
+# Live, in-memory overrides for the per-worker router knobs (``model_quality``
+# and ``modalities``). Same lifecycle as ``WORKER_WEIGHT_OVERRIDES``: not
+# persisted, populated by the dashboard, consumed at routing time. Each value
+# is a partial metadata dict whose keys shadow the worker's advertised
+# metadata for the duration of the coordinator process.
+WORKER_ROUTER_OVERRIDES: dict[str, dict[str, Any]] = {}
+
 
 class SchedulingError(RuntimeError):
     """Raised when the coordinator cannot select a worker."""
@@ -159,7 +167,7 @@ def choose_worker(
         worker
         for worker in workers
         if worker.supports_model(requested_model)
-        and worker_supports_modalities(worker.metadata, required_modalities)
+        and worker_supports_modalities(_effective_metadata(worker), required_modalities)
     ]
     if not eligible_workers:
         non_text = sorted(required_modalities - {"text"})
@@ -176,8 +184,7 @@ def choose_worker(
     jitter_max = _jitter_max(eligible_workers)
     complexity = estimate_complexity_score(prompt_text)
     candidates = [
-        _score_worker(prompt_text, jitter_max, complexity, worker)
-        for worker in eligible_workers
+        _score_worker(prompt_text, jitter_max, complexity, worker) for worker in eligible_workers
     ]
     return min(candidates, key=lambda choice: (choice.cost, choice.worker.node_id))
 
@@ -216,7 +223,7 @@ def _score_worker(
     thermal_term = weights.thermal * telemetry.theta_w
     worker_weight = _worker_weight(worker)
 
-    model_quality = worker_model_quality(worker.metadata)
+    model_quality = worker_model_quality(_effective_metadata(worker))
     quality_term = quality_routing_term(weights.nu, complexity, model_quality)
 
     return WorkerChoice(
@@ -239,6 +246,22 @@ def _score_worker(
         model_quality=model_quality,
         quality_term=quality_term,
     )
+
+
+def _effective_metadata(worker: WorkerSnapshot) -> dict[str, Any]:
+    """Return worker metadata with live router overrides applied.
+
+    Dashboard-driven overrides in :data:`WORKER_ROUTER_OVERRIDES` win over the
+    metadata the worker advertised at registration time, so changes from
+    ``POST /v1/scheduler/worker_router`` take effect on the next request
+    without restarting either process.
+    """
+    override = WORKER_ROUTER_OVERRIDES.get(worker.node_id)
+    if not override:
+        return dict(worker.metadata)
+    merged = dict(worker.metadata)
+    merged.update(override)
+    return merged
 
 
 def _worker_weight(worker: WorkerSnapshot) -> float:

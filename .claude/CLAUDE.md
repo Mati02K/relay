@@ -12,7 +12,7 @@ Also read:
 
 ## Project Summary
 
-Relay is an experimental Control Plane for Edge LLM Serving. Clients call an
+Relay is an experimental Control Plane for Distributed Edge Inference. Clients call an
 OpenAI-compatible coordinator endpoint. The coordinator reads worker metadata
 and telemetry, chooses one worker for the request, forwards the request, and
 streams the response back to the client.

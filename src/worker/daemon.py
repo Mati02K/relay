@@ -14,7 +14,7 @@ from loguru import logger
 
 from membership.base import MembershipLayer
 from membership.etcd import EtcdMembership
-from network.tailscale import TailscaleNetwork
+from network import NetworkLayer, build_network
 from telemetry.request_metrics import extract_usage_prompt_tokens
 from telemetry.schemas import SystemTelemetry, ThermalSourceTelemetry, ThermalTelemetry
 from telemetry.state import WorkerTelemetryState
@@ -42,6 +42,7 @@ class WorkerDaemon:
         node_id: str,
         address: str,
         membership: MembershipLayer,
+        network: NetworkLayer,
         inference_engine: InferenceEngine,
         telemetry: WorkerTelemetryState | None = None,
         thermal: ThermalAggregator | None = None,
@@ -52,6 +53,7 @@ class WorkerDaemon:
         self.node_id = node_id
         self.address = address
         self.membership = membership
+        self.network = network
         self.inference_engine = inference_engine
         self.weight = max(-1.0, min(1.0, float(weight)))
         self.telemetry = telemetry or WorkerTelemetryState()
@@ -68,9 +70,8 @@ class WorkerDaemon:
         """Build the worker daemon from environment configuration."""
         node_id = os.getenv("NODE_ID", "worker")
         port = int(os.getenv("WORKER_PORT", "9090"))
-        host = os.getenv("WORKER_HOST")
-        if not host:
-            host = TailscaleNetwork().getMyAddress()
+        network = build_network()
+        host = os.getenv("WORKER_HOST") or network.getMyAddress()
         address = f"http://{host}:{port}"
 
         membership = EtcdMembership(
@@ -90,6 +91,7 @@ class WorkerDaemon:
             node_id=node_id,
             address=address,
             membership=membership,
+            network=network,
             inference_engine=inference_engine,
             weight=weight,
         )

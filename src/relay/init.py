@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 from relay.config import (
+    KNOWN_MODALITIES,
     ConfigError,
     CoordinatorConfig,
     EngineConfig,
@@ -43,6 +44,9 @@ class InitOptions:
     model_path: str | None
     skip_model: bool
     worker_weight: float | None = None
+    model_quality: float | None = None
+    modalities: str | None = None
+    nu: float | None = None
 
 
 def run_init(options: InitOptions) -> RelayConfig:
@@ -72,6 +76,8 @@ def run_init(options: InitOptions) -> RelayConfig:
 
     prompted_node_id = options.node_id or _prompt_text("Node id", default=None, required=False)
     worker_weight = _select_worker_weight(role, options.worker_weight)
+    model_quality = _select_model_quality(role, options.model_quality)
+    modalities = _select_modalities(role, options.modalities)
     config_kwargs: dict[str, object] = {
         "role": role,
         "network": NetworkConfig(backend=network),
@@ -81,6 +87,8 @@ def run_init(options: InitOptions) -> RelayConfig:
             host=host,
             coordinator_url=coordinator_url,
             weight=worker_weight,
+            model_quality=model_quality,
+            modalities=modalities,
         ),
         "engine": EngineConfig(),
     }
@@ -92,7 +100,7 @@ def run_init(options: InitOptions) -> RelayConfig:
         config = _configure_model(config, options)
 
     if config.runs_coordinator:
-        config = _configure_scheduler(config)
+        config = _configure_scheduler(config, options)
 
     print("Preparing runtime software...")
     ensure_runtime_software(config)
@@ -132,15 +140,15 @@ def _select_network(value: str | None) -> NetworkBackend:
     if value:
         return cast(
             NetworkBackend,
-            _validate_choice(value, ("tailscale", "lan"), "network"),
+            _validate_choice(value, ("lan", "tailscale"), "network"),
         )
     return cast(
         NetworkBackend,
         _prompt_choice(
             "Network backend",
-            ("tailscale", "lan"),
-            default="tailscale",
-            suffix={"lan": "future/experimental"},
+            ("lan", "tailscale"),
+            default="lan",
+            suffix={"tailscale": "for cross-network/multi-site deployments"},
         ),
     )
 
@@ -177,31 +185,40 @@ def _configure_model(config: RelayConfig, options: InitOptions) -> RelayConfig:
     return updated
 
 
-def _configure_scheduler(config: RelayConfig) -> RelayConfig:
+def _configure_scheduler(config: RelayConfig, options: InitOptions) -> RelayConfig:
     """Ask whether to keep default scheduler weights or tune each one.
 
     Only runs for coordinator/dual nodes — workers don't schedule anyone.
-    Default keeps all five weights at 1.0 (paper-style equal influence).
-    Advanced asks one prompt per weight, defaulting to the current value.
+    Default keeps the base 5 weights at 1.0 and ``nu`` at 0.0 (quality
+    routing off). Advanced asks one prompt per weight, defaulting to the
+    current value. A ``--nu`` flag is honoured even in default mode so
+    operators can opt into RouteLLM routing without the advanced prompt.
     """
+    current = config.scheduler
+    nu_override = _validated_nu(options.nu)
+
     action = _prompt_choice(
         "Scheduler tuning",
         ("default", "advanced"),
         default="default",
         suffix={
-            "default": "all weights = 1.0 (recommended)",
-            "advanced": "tune queue / prefix / memory / jitter / thermal",
+            "default": "all weights = 1.0, nu = 0.0 (recommended)",
+            "advanced": "tune queue / prefix / memory / jitter / thermal / nu",
         },
     )
     if action == "default":
-        return config
+        if nu_override is None:
+            return config
+        return config.model_copy(
+            update={"scheduler": current.model_copy(update={"nu": nu_override})},
+        )
 
     print(
-        "Pick a weight per signal in the range [0.0, 1.0]. "
-        "1.0 = full influence, 0.0 = signal disabled, in-between dampens it."
+        "Pick a weight per signal. Base weights are [0.0, 1.0] (1.0 = full "
+        "influence, 0.0 = signal off). nu is [0.0, 50.0] (0 disables "
+        "quality routing; SCHEDULER.md uses nu=5 and nu=20)."
     )
     print("Enter to keep the current value.")
-    current = config.scheduler
     weights = SchedulerConfig(
         queue=_prompt_float(
             "Queue weight (deep queue vs. decode speed)",
@@ -223,12 +240,35 @@ def _configure_scheduler(config: RelayConfig) -> RelayConfig:
             "Thermal weight (throttled workers)",
             default=current.thermal,
         ),
+        nu=nu_override
+        if nu_override is not None
+        else _prompt_float(
+            "nu (RouteLLM quality routing; 0 to disable, 5–20 typical)",
+            default=current.nu,
+            lo=0.0,
+            hi=50.0,
+        ),
     )
     return config.model_copy(update={"scheduler": weights})
 
 
-def _prompt_float(label: str, *, default: float) -> float:
-    """Prompt for a weight in ``[0.0, 1.0]``; blank input keeps ``default``."""
+def _validated_nu(flag_value: float | None) -> float | None:
+    """Validate a ``--nu`` CLI flag value and raise on out-of-range input."""
+    if flag_value is None:
+        return None
+    if not 0.0 <= flag_value <= 50.0:
+        raise ConfigError(f"nu must be between 0.0 and 50.0 (got {flag_value})")
+    return flag_value
+
+
+def _prompt_float(
+    label: str,
+    *,
+    default: float,
+    lo: float = 0.0,
+    hi: float = 1.0,
+) -> float:
+    """Prompt for a float in ``[lo, hi]``; blank input keeps ``default``."""
     while True:
         raw = input(f"{label} [{default}]: ").strip()
         if not raw:
@@ -238,8 +278,8 @@ def _prompt_float(label: str, *, default: float) -> float:
         except ValueError:
             print(f"Invalid number: {raw!r}. Try again.")
             continue
-        if value < 0.0 or value > 1.0:
-            print(f"Weight must be between 0.0 and 1.0 (got {value}). Try again.")
+        if value < lo or value > hi:
+            print(f"Value must be between {lo} and {hi} (got {value}). Try again.")
             continue
         return value
 
@@ -254,9 +294,7 @@ def _select_worker_weight(role: NodeRole, flag_value: float | None) -> float:
         return 0.0
     if flag_value is not None:
         if not -1.0 <= flag_value <= 1.0:
-            raise ConfigError(
-                f"worker-weight must be between -1.0 and 1.0 (got {flag_value})"
-            )
+            raise ConfigError(f"worker-weight must be between -1.0 and 1.0 (got {flag_value})")
         return flag_value
     while True:
         raw = input("Worker weight (scheduler preference) [0.0]: ").strip()
@@ -271,6 +309,64 @@ def _select_worker_weight(role: NodeRole, flag_value: float | None) -> float:
             print(f"Worker weight must be between -1.0 and 1.0 (got {value}). Try again.")
             continue
         return value
+
+
+def _select_model_quality(role: NodeRole, flag_value: float | None) -> float:
+    """Resolve the worker's advertised ``model_quality`` in ``[0.0, 1.0]``.
+
+    Sets how strong this worker's model is relative to others in the
+    cluster: ``1.0`` for the strongest, ``0.3`` for a weak baseline,
+    ``0.5`` default. Coordinator-only nodes skip and store the default.
+    """
+    if role == "coordinator":
+        return 0.5
+    if flag_value is not None:
+        if not 0.0 <= flag_value <= 1.0:
+            raise ConfigError(f"model-quality must be between 0.0 and 1.0 (got {flag_value})")
+        return flag_value
+    return _prompt_float(
+        "Model quality (router; 1.0=strongest, 0.3=weak)",
+        default=0.5,
+    )
+
+
+def _select_modalities(role: NodeRole, flag_value: str | None) -> list[str]:
+    """Resolve the worker's advertised modality list.
+
+    Accepts a comma-separated string from the CLI flag, e.g. ``text,image``.
+    Coordinator-only nodes default to ``["text"]`` (never consulted).
+    """
+    if role == "coordinator":
+        return ["text"]
+    if flag_value is not None:
+        return _parse_modalities(flag_value)
+    raw = input("Modalities (comma-separated; text/image/audio/video) [text]: ").strip()
+    if not raw:
+        return ["text"]
+    try:
+        return _parse_modalities(raw)
+    except ConfigError as e:
+        print(f"{e}. Falling back to default 'text'.")
+        return ["text"]
+
+
+def _parse_modalities(raw: str) -> list[str]:
+    """Parse and validate a comma-separated modality list."""
+    items = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not items:
+        raise ConfigError("modalities must contain at least one entry")
+    unknown = [item for item in items if item not in KNOWN_MODALITIES]
+    if unknown:
+        raise ConfigError(f"unknown modalities {unknown}; allowed: {list(KNOWN_MODALITIES)}")
+    # De-dup while preserving order for stable, human-readable config files.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
 
 
 def _select_local_model(config: RelayConfig) -> RelayConfig:
@@ -395,7 +491,7 @@ def _resolve_catalog_model_selection(value: str) -> str:
 
 
 def _default_host(network: NetworkBackend) -> str:
-    if network != "tailscale":
+    if network == "lan":
         return "127.0.0.1"
     tailscale = shutil.which("tailscale")
     if not tailscale:

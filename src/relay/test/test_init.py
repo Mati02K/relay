@@ -19,8 +19,9 @@ def test_interactive_pull_accepts_numbered_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RELAY_HOME", str(tmp_path))
-    # Inputs in order: worker weight, model setup choice, model number, scheduler choice.
-    inputs = iter(["", "pull", "1", "default"])
+    # Inputs in order: worker weight, model quality, modalities, model setup choice,
+    # model number, scheduler choice. Blank entries keep the defaults.
+    inputs = iter(["", "", "", "pull", "1", "default"])
 
     def fake_input(prompt: str) -> str:
         return next(inputs)
@@ -49,9 +50,13 @@ def test_interactive_pull_accepts_numbered_model(
 
     config = load_config(tmp_path / "config.json")
     assert config.models[0].id == "qwen2.5-0.5b"
-    # "default" scheduler choice leaves all five weights at 1.0.
+    # "default" scheduler choice leaves base 5 weights at 1.0 and nu at 0.0.
     assert config.scheduler.queue == 1.0
     assert config.scheduler.prefix_miss == 1.0
     assert config.scheduler.memory == 1.0
     assert config.scheduler.jitter == 1.0
     assert config.scheduler.thermal == 1.0
+    assert config.scheduler.nu == 0.0
+    # Worker router defaults: model_quality=0.5, modalities=["text"].
+    assert config.worker.model_quality == 0.5
+    assert config.worker.modalities == ["text"]
