@@ -106,7 +106,7 @@ class WorkerDaemon:
             await self.ensure_ready()
 
         telemetry = await self.telemetry.snapshot()
-        metadata = {
+        metadata: dict[str, Any] = {
             "role": "worker",
             "node_id": self.node_id,
             "address": self.address,
@@ -116,6 +116,9 @@ class WorkerDaemon:
             "prefix_cache": telemetry.prefix_cache.model_dump(),
             "weight": self.weight,
         }
+        router_metadata = _router_metadata()
+        if router_metadata:
+            metadata.update(router_metadata)
         await self.membership.holdLease(WORKER_LEASE_TTL_SECONDS)
         await self.membership.register(self.node_id, metadata)
         await self.membership.putWithLease(self._metadata_key(), json.dumps(metadata))
@@ -275,6 +278,43 @@ def _worker_engines() -> list[str]:
         if isinstance(engines, list):
             return [item for item in engines if isinstance(item, str)]
     return [os.getenv("RELAY_ENGINE", "llama.cpp")]
+
+
+def _router_metadata() -> dict[str, Any]:
+    """Return router-relevant fields read from environment variables.
+
+    Two keys can appear:
+
+    * ``model_quality`` — float in ``[0, 1]`` from ``RELAY_MODEL_QUALITY``;
+      consumed by the quality-aware router (``nu`` cost term).
+    * ``modalities`` — list of strings from ``RELAY_MODALITIES``
+      (comma-separated, e.g. ``"text,image"``); consumed by the
+      modality filter in :func:`coordinator.scheduler.choose_worker`.
+
+    Both fields are optional. If unset, the coordinator falls back to
+    its defaults (``model_quality=0.5``, ``modalities={"text"}``).
+    """
+    out: dict[str, Any] = {}
+    raw_quality = os.getenv("RELAY_MODEL_QUALITY")
+    if raw_quality is not None and raw_quality.strip():
+        try:
+            quality = float(raw_quality)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid RELAY_MODEL_QUALITY={!r}", raw_quality
+            )
+        else:
+            out["model_quality"] = max(0.0, min(1.0, quality))
+    raw_modalities = os.getenv("RELAY_MODALITIES")
+    if raw_modalities:
+        modalities = [
+            part.strip().lower()
+            for part in raw_modalities.split(",")
+            if part.strip()
+        ]
+        if modalities:
+            out["modalities"] = modalities
+    return out
 
 
 def _worker_models() -> list[dict[str, Any]]:

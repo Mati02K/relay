@@ -218,10 +218,15 @@ async def chatCompletions(request: Request) -> StreamingResponse:
             "X-Relay-Matched-Tokens": str(choice.matched_tokens),
             "X-Relay-Prompt-Tokens": str(choice.prompt_tokens),
             "X-Relay-Overlap": f"{choice.overlap:.4f}",
+            "X-Relay-Complexity": f"{choice.complexity:.4f}",
+            "X-Relay-Model-Quality": f"{choice.model_quality:.4f}",
+            "X-Relay-Quality-Term": f"{choice.quality_term:.4f}",
             "X-Relay-Attempts": str(attempts),
             "Access-Control-Expose-Headers": (
                 "X-Relay-Worker, X-Relay-Cost, X-Relay-Matched-Tokens, "
-                "X-Relay-Prompt-Tokens, X-Relay-Overlap, X-Relay-Attempts"
+                "X-Relay-Prompt-Tokens, X-Relay-Overlap, "
+                "X-Relay-Complexity, X-Relay-Model-Quality, "
+                "X-Relay-Quality-Term, X-Relay-Attempts"
             ),
         },
     )
@@ -283,6 +288,8 @@ async def listWorkers() -> list[dict[str, Any]]:
             "engines": worker.metadata.get("engines", []),
             "weight": worker.metadata.get("weight", 0.0),
             "weight_override": scheduler_module.WORKER_WEIGHT_OVERRIDES.get(worker.node_id),
+            "model_quality": worker.metadata.get("model_quality"),
+            "modalities": worker.metadata.get("modalities"),
             "healthy": health_by_node.get(worker.node_id, {}).get("healthy", False),
             "health": health_by_node.get(worker.node_id, _unknown_worker_health()),
             "telemetry": worker.telemetry.model_dump(),

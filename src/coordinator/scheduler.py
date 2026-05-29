@@ -1,19 +1,22 @@
 """Cache-aware worker scheduler.
 
 The coordinator uses this module to choose one worker for each incoming
-OpenAI-style request. The scheduler follows the paper-style cost function:
+OpenAI-style request. The scheduler follows the paper-style cost function
+extended with a RouteLLM-style quality-routing term:
 
-``queue_weight * q_w
+``queue_weight    * q_w
 + prefix_miss_weight * (1 - overlap(w, r))
-+ memory_weight * m_w
-+ jitter_weight * j_w / j_max
-+ thermal_weight * theta_w
++ memory_weight     * m_w
++ jitter_weight     * j_w / j_max
++ thermal_weight    * theta_w
++ nu                * complexity(r) * (1 - model_quality_w)
 - worker_weight(w)``
 
-Lower cost is better. The five global weights are configurable through
-environment variables so the scheduler can be tuned without changing code.
-``worker_weight(w)`` is a per-worker preference advertised by each worker in
-its metadata; default ``0.0`` makes it inert.
+Lower cost is better. The global weights are configurable through environment
+variables so the scheduler can be tuned without changing code. The
+quality term is sourced from :mod:`coordinator.router`. ``worker_weight(w)``
+is a per-worker preference advertised by each worker in its metadata;
+default ``0.0`` makes it inert.
 """
 
 from __future__ import annotations
@@ -22,6 +25,13 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from coordinator.router import (
+    detect_request_modalities,
+    estimate_complexity_score,
+    quality_routing_term,
+    worker_model_quality,
+    worker_supports_modalities,
+)
 from coordinator.worker_registry import WorkerSnapshot
 from telemetry.prefix_cache import (
     compute_prefix_hashes_from_text,
@@ -47,16 +57,23 @@ class SchedulerWeights:
     memory: float = 1.0
     jitter: float = 1.0
     thermal: float = 1.0
+    nu: float = 0.0
 
     @classmethod
     def from_env(cls) -> SchedulerWeights:
-        """Initialise from ``RELAY_SCHED_*_WEIGHT`` env vars."""
+        """Initialise from ``RELAY_SCHED_*_WEIGHT`` env vars.
+
+        ``RELAY_SCHED_NU_WEIGHT`` controls the RouteLLM-style quality
+        routing term; default ``0.0`` keeps the scheduler behaviour
+        backwards-compatible until quality routing is opted into.
+        """
         return cls(
             queue=float(os.getenv("RELAY_SCHED_QUEUE_WEIGHT", "1.0")),
             prefix_miss=float(os.getenv("RELAY_SCHED_PREFIX_MISS_WEIGHT", "1.0")),
             memory=float(os.getenv("RELAY_SCHED_MEMORY_WEIGHT", "1.0")),
             jitter=float(os.getenv("RELAY_SCHED_JITTER_WEIGHT", "1.0")),
             thermal=float(os.getenv("RELAY_SCHED_THERMAL_WEIGHT", "1.0")),
+            nu=float(os.getenv("RELAY_SCHED_NU_WEIGHT", "0.0")),
         )
 
     def update(self, **fields: float) -> None:
@@ -74,6 +91,7 @@ class SchedulerWeights:
             "memory": self.memory,
             "jitter": self.jitter,
             "thermal": self.thermal,
+            "nu": self.nu,
         }
 
 
@@ -106,6 +124,9 @@ class WorkerChoice:
         prompt_tokens: Approximate total prompt tokens in the request.
         uncached_prompt_tokens: Prompt tokens expected to require prefill work.
         overlap: Fraction of prompt tokens matched by the worker prefix cache.
+        complexity: RouteLLM-style complexity score for the request.
+        model_quality: Quality value advertised by this worker.
+        quality_term: Final ``nu * complexity * (1 - model_quality)`` cost.
     """
 
     worker: WorkerSnapshot
@@ -115,6 +136,9 @@ class WorkerChoice:
     prompt_tokens: int
     uncached_prompt_tokens: int
     overlap: float
+    complexity: float = 0.0
+    model_quality: float = 0.0
+    quality_term: float = 0.0
 
 
 def choose_worker(
@@ -130,24 +154,46 @@ def choose_worker(
     if not workers:
         raise SchedulingError("No workers registered")
     requested_model = _requested_model(request)
-    eligible_workers = [worker for worker in workers if worker.supports_model(requested_model)]
+    required_modalities = detect_request_modalities(request)
+    eligible_workers = [
+        worker
+        for worker in workers
+        if worker.supports_model(requested_model)
+        and worker_supports_modalities(worker.metadata, required_modalities)
+    ]
     if not eligible_workers:
+        non_text = sorted(required_modalities - {"text"})
+        if non_text:
+            raise SchedulingError(
+                f"No workers can serve required modalities {non_text}"
+                + (f" for model '{requested_model}'" if requested_model else "")
+            )
         if requested_model:
             raise SchedulingError(f"No workers can serve requested model '{requested_model}'")
         raise SchedulingError("No workers can serve this request")
 
     prompt_text = request_to_prefix_text(request)
     jitter_max = _jitter_max(eligible_workers)
-    candidates = [_score_worker(prompt_text, jitter_max, worker) for worker in eligible_workers]
+    complexity = estimate_complexity_score(prompt_text)
+    candidates = [
+        _score_worker(prompt_text, jitter_max, complexity, worker)
+        for worker in eligible_workers
+    ]
     return min(candidates, key=lambda choice: (choice.cost, choice.worker.node_id))
 
 
 def _score_worker(
     prompt_text: str,
     jitter_max: float,
+    complexity: float,
     worker: WorkerSnapshot,
 ) -> WorkerChoice:
-    """Compute the paper-style scheduler cost for one worker."""
+    """Compute the scheduler cost for one worker.
+
+    Cost = base 5-term paper formula (queue, prefix-miss, memory, jitter,
+    thermal) plus the RouteLLM-style ``nu * complexity * (1 - quality)``
+    term contributed by :mod:`coordinator.router`.
+    """
     telemetry = worker.telemetry
     prefix_cache = telemetry.prefix_cache
     prefix_config = prefix_cache.to_hash_config()
@@ -170,14 +216,28 @@ def _score_worker(
     thermal_term = weights.thermal * telemetry.theta_w
     worker_weight = _worker_weight(worker)
 
+    model_quality = worker_model_quality(worker.metadata)
+    quality_term = quality_routing_term(weights.nu, complexity, model_quality)
+
     return WorkerChoice(
         worker=worker,
-        cost=queue_term + prefix_term + memory_term + jitter_term + thermal_term - worker_weight,
+        cost=(
+            queue_term
+            + prefix_term
+            + memory_term
+            + jitter_term
+            + thermal_term
+            + quality_term
+            - worker_weight
+        ),
         matched_blocks=matched_blocks,
         matched_tokens=matched_tokens,
         prompt_tokens=prompt_tokens,
         uncached_prompt_tokens=uncached_prompt_tokens,
         overlap=overlap,
+        complexity=complexity,
+        model_quality=model_quality,
+        quality_term=quality_term,
     )
 
 
