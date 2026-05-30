@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import cast
 
 from relay.config import (
-    KNOWN_MODALITIES,
     ConfigError,
     CoordinatorConfig,
     EngineConfig,
@@ -44,8 +43,6 @@ class InitOptions:
     model_path: str | None
     skip_model: bool
     worker_weight: float | None = None
-    model_quality: float | None = None
-    modalities: str | None = None
     nu: float | None = None
 
 
@@ -76,8 +73,6 @@ def run_init(options: InitOptions) -> RelayConfig:
 
     prompted_node_id = options.node_id or _prompt_text("Node id", default=None, required=False)
     worker_weight = _select_worker_weight(role, options.worker_weight)
-    model_quality = _select_model_quality(role, options.model_quality)
-    modalities = _select_modalities(role, options.modalities)
     config_kwargs: dict[str, object] = {
         "role": role,
         "network": NetworkConfig(backend=network),
@@ -87,8 +82,6 @@ def run_init(options: InitOptions) -> RelayConfig:
             host=host,
             coordinator_url=coordinator_url,
             weight=worker_weight,
-            model_quality=model_quality,
-            modalities=modalities,
         ),
         "engine": EngineConfig(),
     }
@@ -215,8 +208,8 @@ def _configure_scheduler(config: RelayConfig, options: InitOptions) -> RelayConf
 
     print(
         "Pick a weight per signal. Base weights are [0.0, 1.0] (1.0 = full "
-        "influence, 0.0 = signal off). nu is [0.0, 20.0] (0 disables "
-        "quality routing; SCHEDULER.md uses nu=5 and nu=20)."
+        "influence, 0.0 = signal off). nu is [0.0, 5.0] (0 disables "
+        "chart-driven routing entirely; 2-3 is a good default)."
     )
     print("Enter to keep the current value.")
     weights = SchedulerConfig(
@@ -243,10 +236,10 @@ def _configure_scheduler(config: RelayConfig, options: InitOptions) -> RelayConf
         nu=nu_override
         if nu_override is not None
         else _prompt_float(
-            "nu (RouteLLM quality routing; 0 to disable, 5 or 20 typical)",
+            "nu (RouteLLM quality routing; 0 disables chart, 2-3 typical)",
             default=current.nu,
             lo=0.0,
-            hi=20.0,
+            hi=5.0,
         ),
     )
     return config.model_copy(update={"scheduler": weights})
@@ -256,8 +249,8 @@ def _validated_nu(flag_value: float | None) -> float | None:
     """Validate a ``--nu`` CLI flag value and raise on out-of-range input."""
     if flag_value is None:
         return None
-    if not 0.0 <= flag_value <= 20.0:
-        raise ConfigError(f"nu must be between 0.0 and 20.0 (got {flag_value})")
+    if not 0.0 <= flag_value <= 5.0:
+        raise ConfigError(f"nu must be between 0.0 and 5.0 (got {flag_value})")
     return flag_value
 
 
@@ -309,64 +302,6 @@ def _select_worker_weight(role: NodeRole, flag_value: float | None) -> float:
             print(f"Worker weight must be between -1.0 and 1.0 (got {value}). Try again.")
             continue
         return value
-
-
-def _select_model_quality(role: NodeRole, flag_value: float | None) -> float:
-    """Resolve the worker's advertised ``model_quality`` in ``[0.0, 1.0]``.
-
-    Sets how strong this worker's model is relative to others in the
-    cluster: ``1.0`` for the strongest, ``0.3`` for a weak baseline,
-    ``0.5`` default. Coordinator-only nodes skip and store the default.
-    """
-    if role == "coordinator":
-        return 0.5
-    if flag_value is not None:
-        if not 0.0 <= flag_value <= 1.0:
-            raise ConfigError(f"model-quality must be between 0.0 and 1.0 (got {flag_value})")
-        return flag_value
-    return _prompt_float(
-        "Model quality (router; 1.0=strongest, 0.3=weak)",
-        default=0.5,
-    )
-
-
-def _select_modalities(role: NodeRole, flag_value: str | None) -> list[str]:
-    """Resolve the worker's advertised modality list.
-
-    Accepts a comma-separated string from the CLI flag, e.g. ``text,image``.
-    Coordinator-only nodes default to ``["text"]`` (never consulted).
-    """
-    if role == "coordinator":
-        return ["text"]
-    if flag_value is not None:
-        return _parse_modalities(flag_value)
-    raw = input("Modalities (comma-separated; text/image/audio/video) [text]: ").strip()
-    if not raw:
-        return ["text"]
-    try:
-        return _parse_modalities(raw)
-    except ConfigError as e:
-        print(f"{e}. Falling back to default 'text'.")
-        return ["text"]
-
-
-def _parse_modalities(raw: str) -> list[str]:
-    """Parse and validate a comma-separated modality list."""
-    items = [part.strip().lower() for part in raw.split(",") if part.strip()]
-    if not items:
-        raise ConfigError("modalities must contain at least one entry")
-    unknown = [item for item in items if item not in KNOWN_MODALITIES]
-    if unknown:
-        raise ConfigError(f"unknown modalities {unknown}; allowed: {list(KNOWN_MODALITIES)}")
-    # De-dup while preserving order for stable, human-readable config files.
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        deduped.append(item)
-    return deduped
 
 
 def _select_local_model(config: RelayConfig) -> RelayConfig:

@@ -17,10 +17,20 @@ variables so the scheduler can be tuned without changing code. The
 quality term is sourced from :mod:`coordinator.router`. ``worker_weight(w)``
 is a per-worker preference advertised by each worker in its metadata;
 default ``0.0`` makes it inert.
+
+Routing also runs two filters before scoring:
+
+1. A hard input-modality filter (text / image / audio / video) — anything
+   the chart says a model can't accept is dropped.
+2. A soft skill filter (coding / reasoning / instruct) — if at least one
+   worker advertises every needed skill, only those are scored;
+   otherwise scoring proceeds with the entire input-modality-eligible
+   set so the request still goes somewhere.
 """
 
 from __future__ import annotations
 
+import itertools
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -29,11 +39,12 @@ from typing import Any
 from loguru import logger
 
 from coordinator.router import (
+    Classification,
+    ModelEntry,
+    classify,
     detect_request_modalities,
-    estimate_complexity_score,
+    lookup,
     quality_routing_term,
-    worker_model_quality,
-    worker_supports_modalities,
 )
 from coordinator.worker_registry import WorkerSnapshot
 from telemetry.prefix_cache import (
@@ -110,12 +121,49 @@ WEIGHTS = SchedulerWeights.from_env()
 # tuning knob, not configuration.
 WORKER_WEIGHT_OVERRIDES: dict[str, float] = {}
 
-# Live, in-memory overrides for the per-worker router knobs (``model_quality``
-# and ``modalities``). Same lifecycle as ``WORKER_WEIGHT_OVERRIDES``: not
-# persisted, populated by the dashboard, consumed at routing time. Each value
-# is a partial metadata dict whose keys shadow the worker's advertised
-# metadata for the duration of the coordinator process.
-WORKER_ROUTER_OVERRIDES: dict[str, dict[str, Any]] = {}
+
+SCHEDULER_MODES: tuple[str, ...] = ("cost", "round_robin")
+
+
+def _initial_mode() -> str:
+    """Resolve the scheduler mode from ``RELAY_SCHED_MODE``, default ``cost``."""
+    raw = os.getenv("RELAY_SCHED_MODE", "cost").strip().lower()
+    return raw if raw in SCHEDULER_MODES else "cost"
+
+
+# Live scheduler mode. ``cost`` runs the full cost-based scoring path; ``round_robin``
+# bypasses scoring and rotates across eligible workers. Flipped at runtime via
+# ``POST /v1/scheduler/mode``; not persisted across coordinator restarts.
+SCHEDULER_MODE: str = _initial_mode()
+
+# Process-wide counter that drives the rotation in round-robin mode. Reset on
+# coordinator restart by design (in-memory only). Not exposed externally.
+_RR_COUNTER: itertools.count[int] = itertools.count()
+
+
+def get_mode() -> str:
+    """Return the current scheduler mode."""
+    return SCHEDULER_MODE
+
+
+def set_mode(mode: str) -> str:
+    """Set the scheduler mode. Raises ``ValueError`` on an unknown mode."""
+    global SCHEDULER_MODE, _RR_COUNTER
+    normalised = mode.strip().lower() if isinstance(mode, str) else ""
+    if normalised not in SCHEDULER_MODES:
+        raise ValueError(f"Unknown mode '{mode}'. Allowed: {list(SCHEDULER_MODES)}")
+    if normalised != SCHEDULER_MODE:
+        # Reset rotation when entering round-robin so a flip on stage starts
+        # from the first node — predictable, demo-friendly.
+        _RR_COUNTER = itertools.count()
+    SCHEDULER_MODE = normalised
+    return SCHEDULER_MODE
+
+
+def _reset_round_robin() -> None:
+    """Reset the round-robin counter. Test-only helper."""
+    global _RR_COUNTER
+    _RR_COUNTER = itertools.count()
 
 
 class SchedulingError(RuntimeError):
@@ -135,8 +183,12 @@ class WorkerChoice:
         uncached_prompt_tokens: Prompt tokens expected to require prefill work.
         overlap: Fraction of prompt tokens matched by the worker prefix cache.
         complexity: RouteLLM-style complexity score for the request.
-        model_quality: Quality value advertised by this worker.
+        model_quality: Quality value from the model chart for this worker.
         quality_term: Final ``nu * complexity * (1 - model_quality)`` cost.
+        model_id: Model id this worker was matched on, for routing audit.
+        skills_needed: Skill tags the classifier asked for.
+        skills_available: Skill tags the chosen worker's chart entry advertises.
+        skill_match: Whether ``skills_needed ⊆ skills_available``.
     """
 
     worker: WorkerSnapshot
@@ -149,6 +201,10 @@ class WorkerChoice:
     complexity: float = 0.0
     model_quality: float = 0.0
     quality_term: float = 0.0
+    model_id: str = ""
+    skills_needed: frozenset[str] = frozenset()
+    skills_available: frozenset[str] = frozenset()
+    skill_match: bool = False
 
 
 def choose_worker(
@@ -157,45 +213,117 @@ def choose_worker(
 ) -> WorkerChoice:
     """Choose the lowest-cost worker for an OpenAI-style chat completion request.
 
-    The function first filters out workers that do not advertise the requested
-    model. It then scores every eligible worker and returns the one with the
-    lowest cost. Ties are broken by node id to keep choices deterministic.
+    Filters first by requested model, then by required input modalities (hard),
+    then by classifier-detected skills (soft — falls back to the full
+    modality-eligible set if no worker advertises every required skill). The
+    surviving candidates are scored with the paper cost + RouteLLM ``nu``
+    term and the minimum-cost worker wins. Ties are broken by node id to keep
+    choices deterministic.
     """
     if not workers:
         raise SchedulingError("No workers registered")
     requested_model = _requested_model(request)
     required_modalities = detect_request_modalities(request)
-    eligible_workers = [
-        worker
-        for worker in workers
-        if worker.supports_model(requested_model)
-        and worker_supports_modalities(_effective_metadata(worker), required_modalities)
+    classification = classify(request)
+
+    worker_entries: list[tuple[WorkerSnapshot, ModelEntry]] = [
+        (worker, _entry_for_worker(worker)) for worker in workers
     ]
-    if not eligible_workers:
+
+    model_eligible = [
+        (worker, entry)
+        for worker, entry in worker_entries
+        if worker.supports_model(requested_model)
+    ]
+    if not model_eligible:
+        if requested_model:
+            raise SchedulingError(f"No workers can serve requested model '{requested_model}'")
+        raise SchedulingError("No workers can serve this request")
+
+    modality_eligible = [
+        (worker, entry)
+        for worker, entry in model_eligible
+        if required_modalities.issubset(entry.input_modalities)
+    ]
+    if not modality_eligible:
         non_text = sorted(required_modalities - {"text"})
         if non_text:
             raise SchedulingError(
                 f"No workers can serve required modalities {non_text}"
                 + (f" for model '{requested_model}'" if requested_model else "")
             )
-        if requested_model:
-            raise SchedulingError(f"No workers can serve requested model '{requested_model}'")
         raise SchedulingError("No workers can serve this request")
 
+    if SCHEDULER_MODE == "round_robin":
+        return _round_robin_choice(modality_eligible)
+
+    # `nu` is the master switch for chart-driven routing. When nu == 0 the
+    # quality cost term is already zero; we also skip the soft skill filter so
+    # the chart has zero influence and the scheduler reduces to the base
+    # 5-term paper formula. nu > 0 turns both back on together.
+    if WEIGHTS.nu > 0.0:
+        skill_preferred = [
+            (worker, entry)
+            for worker, entry in modality_eligible
+            if classification.skills_needed.issubset(entry.skills)
+        ]
+        scoring_pool = skill_preferred if skill_preferred else modality_eligible
+    else:
+        scoring_pool = modality_eligible
+
     prompt_text = request_to_prefix_text(request)
-    jitter_max = _jitter_max(eligible_workers)
-    complexity = estimate_complexity_score(prompt_text)
+    jitter_max = _jitter_max([worker for worker, _ in scoring_pool])
     candidates = [
-        _score_worker(prompt_text, jitter_max, complexity, worker) for worker in eligible_workers
+        _score_worker(prompt_text, jitter_max, classification, worker, entry)
+        for worker, entry in scoring_pool
     ]
     return min(candidates, key=lambda choice: (choice.cost, choice.worker.node_id))
+
+
+def _round_robin_choice(
+    eligible: list[tuple[WorkerSnapshot, ModelEntry]],
+) -> WorkerChoice:
+    """Pick the next worker by rotating index in ``eligible`` (stable order).
+
+    The selector ignores telemetry, the model chart's quality, and the soft
+    skill filter — that's the whole point of the round-robin mode. Hard
+    eligibility (model id + input modality) has already been enforced by the
+    caller.
+    """
+    ordered = sorted(eligible, key=lambda pair: pair[0].node_id)
+    idx = next(_RR_COUNTER) % len(ordered)
+    worker, entry = ordered[idx]
+    logger.debug(
+        "scheduler round_robin | nodeId={} modelId={} index={}/{}",
+        worker.node_id,
+        entry.model_id,
+        idx,
+        len(ordered),
+    )
+    return WorkerChoice(
+        worker=worker,
+        cost=0.0,
+        matched_blocks=0,
+        matched_tokens=0,
+        prompt_tokens=0,
+        uncached_prompt_tokens=0,
+        overlap=0.0,
+        complexity=0.0,
+        model_quality=entry.quality,
+        quality_term=0.0,
+        model_id=entry.model_id,
+        skills_needed=frozenset(),
+        skills_available=entry.skills,
+        skill_match=False,
+    )
 
 
 def _score_worker(
     prompt_text: str,
     jitter_max: float,
-    complexity: float,
+    classification: Classification,
     worker: WorkerSnapshot,
+    entry: ModelEntry,
 ) -> WorkerChoice:
     """Compute the scheduler cost for one worker.
 
@@ -225,8 +353,7 @@ def _score_worker(
     thermal_term = weights.thermal * telemetry.theta_w
     worker_weight = _worker_weight(worker)
 
-    model_quality = worker_model_quality(_effective_metadata(worker))
-    quality_term = quality_routing_term(weights.nu, complexity, model_quality)
+    quality_term = quality_routing_term(weights.nu, classification.complexity, entry.quality)
 
     cost = (
         queue_term
@@ -238,17 +365,21 @@ def _score_worker(
         - worker_weight
     )
 
+    skill_match = classification.skills_needed.issubset(entry.skills)
+
     logger.debug(
-        "scheduler cost | nodeId={} "
+        "scheduler cost | nodeId={} modelId={} "
         "| queue: w={} qw={} term={} "
         "| prefix_miss: w={} miss={} term={} "
         "| memory: w={} mw={} term={} "
         "| jitter: w={} jw={} jmax={} term={} "
         "| thermal: w={} theta_w={} term={} "
-        "| nu={} complexity={} model_quality={} quality_term={} "
+        "| nu={} complexity={} quality={} skills_needed={} skills_avail={} "
+        "skill_match={} quality_term={} "
         "| worker_weight={} "
         "| cost={}",
         worker.node_id,
+        entry.model_id,
         weights.queue,
         telemetry.qw,
         queue_term,
@@ -266,8 +397,11 @@ def _score_worker(
         telemetry.theta_w,
         thermal_term,
         weights.nu,
-        complexity,
-        model_quality,
+        classification.complexity,
+        entry.quality,
+        sorted(classification.skills_needed),
+        sorted(entry.skills),
+        skill_match,
         quality_term,
         worker_weight,
         cost,
@@ -281,26 +415,39 @@ def _score_worker(
         prompt_tokens=prompt_tokens,
         uncached_prompt_tokens=uncached_prompt_tokens,
         overlap=overlap,
-        complexity=complexity,
-        model_quality=model_quality,
+        complexity=classification.complexity,
+        model_quality=entry.quality,
         quality_term=quality_term,
+        model_id=entry.model_id,
+        skills_needed=classification.skills_needed,
+        skills_available=entry.skills,
+        skill_match=skill_match,
     )
 
 
-def _effective_metadata(worker: WorkerSnapshot) -> dict[str, Any]:
-    """Return worker metadata with live router overrides applied.
+def _entry_for_worker(worker: WorkerSnapshot) -> ModelEntry:
+    """Resolve the model chart entry for the worker's first loaded model."""
+    model_id, quant = _primary_model_descriptor(worker.metadata)
+    return lookup(model_id, quant_hint=quant)
 
-    Dashboard-driven overrides in :data:`WORKER_ROUTER_OVERRIDES` win over the
-    metadata the worker advertised at registration time, so changes from
-    ``POST /v1/scheduler/worker_router`` take effect on the next request
-    without restarting either process.
-    """
-    override = WORKER_ROUTER_OVERRIDES.get(worker.node_id)
-    if not override:
-        return dict(worker.metadata)
-    merged = dict(worker.metadata)
-    merged.update(override)
-    return merged
+
+def _primary_model_descriptor(metadata: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return ``(model_id, quant)`` for the worker's first loaded model."""
+    models = metadata.get("models")
+    if not isinstance(models, list):
+        return None, None
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        if not model.get("loaded", True):
+            continue
+        model_id = model.get("id")
+        quant = model.get("quant")
+        return (
+            model_id if isinstance(model_id, str) else None,
+            quant if isinstance(quant, str) else None,
+        )
+    return None, None
 
 
 def _worker_weight(worker: WorkerSnapshot) -> float:

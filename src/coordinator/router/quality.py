@@ -1,37 +1,15 @@
-"""Per-worker quality lookup and the quality-routing cost term.
+"""Quality-routing cost term.
 
-A worker self-advertises a ``model_quality`` value in [0.0, 1.0] via
-its registration metadata. ``1.0`` means "strongest model available
-in the cluster"; ``0.0`` means "weakest". The scheduler combines this
-with the prompt's complexity score to produce a cost term that biases
-hard prompts toward high-quality workers.
+The cost term is the RouteLLM-style ``nu * complexity * (1 - quality)``
+contribution to the scheduler. Quality is now sourced from the
+coordinator-side model chart (:mod:`coordinator.router.model_chart`)
+keyed by the worker's loaded model id, not from worker-advertised
+metadata.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-DEFAULT_MODEL_QUALITY = 0.5
-
-
-def worker_model_quality(metadata: dict[str, Any]) -> float:
-    """Return the worker's advertised ``model_quality`` in [0, 1].
-
-    Falls back to :data:`DEFAULT_MODEL_QUALITY` if the worker did not
-    advertise a value or advertised something out of range. Workers can
-    set the value via the ``RELAY_MODEL_QUALITY`` environment variable
-    at registration time.
-    """
-    raw = metadata.get("model_quality")
-    if raw is None:
-        return DEFAULT_MODEL_QUALITY
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_MODEL_QUALITY
-    if value != value or value < 0.0:
-        return DEFAULT_MODEL_QUALITY
-    return min(1.0, value)
+DEFAULT_MODEL_QUALITY = 0.4
 
 
 def quality_routing_term(

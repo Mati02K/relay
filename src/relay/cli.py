@@ -55,20 +55,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="per-worker scheduler preference in [-1.0, 1.0]; default 0.0 (no effect)",
     )
     init_parser.add_argument(
-        "--model-quality",
-        type=float,
-        help="this worker's model quality in [0.0, 1.0] for RouteLLM-style routing; default 0.5",
-    )
-    init_parser.add_argument(
-        "--modalities",
-        help="comma-separated modalities this worker can serve, e.g. 'text,image'; default 'text'",
-    )
-    init_parser.add_argument(
         "--nu",
         type=float,
         help=(
-            "RouteLLM quality-routing weight in [0.0, 20.0]; "
-            "0 disables, 5 or 20 typical (coordinator only)"
+            "RouteLLM quality-routing weight in [0.0, 5.0]; "
+            "0 disables the chart, 2-3 typical (coordinator only)"
         ),
     )
     init_parser.set_defaults(func=_cmd_init)
@@ -153,8 +144,6 @@ def _cmd_init(args: argparse.Namespace) -> int:
             model_path=args.model_path,
             skip_model=bool(args.skip_model),
             worker_weight=args.worker_weight,
-            model_quality=args.model_quality,
-            modalities=args.modalities,
             nu=args.nu,
         )
     )

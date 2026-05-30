@@ -24,8 +24,8 @@ const state = {
   weightsDirty: false,
   workerWeights: null,
   workerWeightsBaseline: null,
-  workerRouter: null,
-  workerRouterBaseline: null,
+  mode: null,
+  modeBaseline: null,
   drawerWorkerId: null,
   prefillHistory: new Map(),
 };
@@ -85,6 +85,8 @@ function cacheElements() {
   el.applyBtn = document.getElementById("apply-btn");
   el.resetBtn = document.getElementById("reset-btn");
   el.applyStatus = document.getElementById("apply-status");
+  el.modeToggle = document.getElementById("mode-toggle");
+  el.modeButtons = el.modeToggle ? Array.from(el.modeToggle.querySelectorAll(".mode-btn")) : [];
 
   // Drawer
   el.drawer = document.getElementById("worker-drawer");
@@ -126,7 +128,7 @@ function switchView(name) {
   if (name === "settings") {
     if (state.weights === null) fetchWeights();
     fetchWorkerWeights();
-    fetchWorkerRouter();
+    fetchSchedulerMode();
   }
   if (name === "map") {
     // Re-render the map so layout fills the now-visible canvas.
@@ -481,10 +483,6 @@ function refreshDrawerIfOpen() {
 
   el.drawerTitle.textContent = worker.node_id;
   el.drawerSub.textContent = worker.address || "—";
-  const quality = worker.model_quality != null ? Number(worker.model_quality).toFixed(2) : "—";
-  const modalities = Array.isArray(worker.modalities) && worker.modalities.length > 0
-    ? worker.modalities.join(", ")
-    : "text";
   el.drawerBody.innerHTML = `
     <div class="drawer-section">
       <div class="drawer-section-title">Health</div>
@@ -493,8 +491,6 @@ function refreshDrawerIfOpen() {
         <dt>engine</dt><dd>${escapeHtml(engine)} (${escapeHtml(engineDetail)})</dd>
         <dt>http</dt><dd>${escapeHtml(String(worker.health?.status_code ?? "—"))}</dd>
         <dt>worker weight</dt><dd>${Number(worker.weight ?? 0).toFixed(2)}</dd>
-        <dt>model quality</dt><dd>${quality}</dd>
-        <dt>modalities</dt><dd>${escapeHtml(modalities)}</dd>
       </dl>
     </div>
     <div class="drawer-section">
@@ -526,7 +522,7 @@ function refreshDrawerIfOpen() {
 // ============================ Settings view ============================
 
 // Compact knob row: one dial per scheduler cost term. `max` distinguishes
-// the base 5 (in [0, 1]) from the `nu` RouteLLM term (in [0, 50]).
+// the base 5 (in [0, 1]) from the `nu` RouteLLM term (in [0, 5]).
 const WEIGHT_FIELDS = [
   {
     key: "queue",
@@ -566,17 +562,24 @@ const WEIGHT_FIELDS = [
   {
     key: "nu",
     label: "ν · quality",
-    max: 20,
-    step: 0.25,
-    hint: "RouteLLM: ν × complexity × (1 − quality). 0 disables. SCHEDULER.md uses 5 and 20.",
+    max: 5,
+    step: 0.1,
+    hint: "RouteLLM: ν × complexity × (1 − quality). 0 disables the chart entirely (no skill filter, no quality term). 2–3 is a good default with the heuristic classifier.",
   },
 ];
-
-const MODALITY_OPTIONS = ["text", "image", "audio", "video"];
 
 function wireSettings() {
   el.applyBtn.addEventListener("click", applyAllWeights);
   el.resetBtn.addEventListener("click", resetAllDirty);
+  for (const btn of el.modeButtons) {
+    btn.addEventListener("click", () => {
+      const next = btn.dataset.mode;
+      if (!next || next === state.mode) return;
+      state.mode = next;
+      renderMode();
+      markWeightsDirty(detectDirty());
+    });
+  }
 }
 
 function resetAllDirty() {
@@ -587,8 +590,9 @@ function resetAllDirty() {
   if (state.workerWeightsBaseline) {
     state.workerWeights = { ...state.workerWeightsBaseline };
   }
-  if (state.workerRouterBaseline) {
-    state.workerRouter = cloneRouter(state.workerRouterBaseline);
+  if (state.modeBaseline !== null) {
+    state.mode = state.modeBaseline;
+    renderMode();
   }
   renderWorkerTable();
   markWeightsDirty(false);
@@ -615,6 +619,8 @@ function renderWeights() {
     el.weightsGrid.innerHTML = '<div class="empty">Loading scheduler weights…</div>';
     return;
   }
+  const locked = state.mode === "round_robin";
+  el.weightsGrid.classList.toggle("locked", locked);
   el.weightsGrid.innerHTML = "";
   for (const field of WEIGHT_FIELDS) {
     const value = Number(state.weights[field.key] ?? 0);
@@ -622,6 +628,7 @@ function renderWeights() {
     const knob = document.createElement("div");
     knob.className = "knob";
     if (value !== baseline) knob.classList.add("dirty");
+    if (locked) knob.classList.add("locked");
     knob.innerHTML = `
       <span class="knob-key">${escapeHtml(field.label)}</span>
       <div class="knob-dial" data-bind="${field.key}-dial">
@@ -631,14 +638,15 @@ function renderWeights() {
         </svg>
         <span class="knob-dial-value" data-bind="${field.key}-num">${formatWeight(value, field.max)}</span>
       </div>
-      <input type="range" min="0" max="${field.max}" step="${field.step}" value="${value}" data-bind="${field.key}-range" />
-      <div class="knob-tooltip">${escapeHtml(field.hint)}</div>
+      <input type="range" min="0" max="${field.max}" step="${field.step}" value="${value}" data-bind="${field.key}-range" ${locked ? "disabled" : ""} />
+      <div class="knob-tooltip">${escapeHtml(locked ? "round-robin mode — cost weights ignored" : field.hint)}</div>
     `;
     el.weightsGrid.appendChild(knob);
     const range = knob.querySelector(`input[data-bind='${field.key}-range']`);
     const numEl = knob.querySelector(`[data-bind='${field.key}-num']`);
     const fillEl = knob.querySelector(".knob-dial-fill");
     range.addEventListener("input", () => {
+      if (locked) return;
       const v = clampRange(parseFloat(range.value), 0, field.max);
       state.weights[field.key] = v;
       numEl.textContent = formatWeight(v, field.max);
@@ -647,6 +655,32 @@ function renderWeights() {
       knob.classList.toggle("dirty", v !== baselineNow);
       markWeightsDirty(detectDirty());
     });
+  }
+}
+
+function renderMode() {
+  if (!el.modeButtons.length) return;
+  const active = state.mode || "cost";
+  for (const btn of el.modeButtons) {
+    const isActive = btn.dataset.mode === active;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
+  if (state.mode !== null) renderWeights();
+}
+
+async function fetchSchedulerMode() {
+  try {
+    const res = await fetch("/api/scheduler/mode");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    const mode = typeof body.mode === "string" ? body.mode : "cost";
+    state.mode = mode;
+    state.modeBaseline = mode;
+    renderMode();
+    markWeightsDirty(detectDirty());
+  } catch (e) {
+    setApplyStatus(`Failed to load scheduler mode: ${e.message || e}`, "error");
   }
 }
 
@@ -672,11 +706,9 @@ function detectDirty() {
     !!state.workerWeights &&
     !!state.workerWeightsBaseline &&
     diffMaps(state.workerWeights, state.workerWeightsBaseline);
-  const workerRouterDirty =
-    !!state.workerRouter &&
-    !!state.workerRouterBaseline &&
-    diffRouter(state.workerRouter, state.workerRouterBaseline);
-  return weightsDirty || workerWeightDirty || workerRouterDirty;
+  const modeDirty =
+    state.mode !== null && state.modeBaseline !== null && state.mode !== state.modeBaseline;
+  return weightsDirty || workerWeightDirty || modeDirty;
 }
 
 function diffMaps(a, b) {
@@ -685,42 +717,6 @@ function diffMaps(a, b) {
     if ((a[key] ?? null) !== (b[key] ?? null)) return true;
   }
   return false;
-}
-
-function diffRouter(a, b) {
-  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  for (const key of keys) {
-    const x = a[key] || null;
-    const y = b[key] || null;
-    if (x === null && y === null) continue;
-    if (x === null || y === null) return true;
-    if ((x.model_quality ?? null) !== (y.model_quality ?? null)) return true;
-    if (!modalitiesEqual(x.modalities, y.modalities)) return true;
-  }
-  return false;
-}
-
-function modalitiesEqual(a, b) {
-  const aa = a || null;
-  const bb = b || null;
-  if (aa === null && bb === null) return true;
-  if (aa === null || bb === null) return false;
-  if (aa.length !== bb.length) return false;
-  const sortedA = [...aa].sort();
-  const sortedB = [...bb].sort();
-  return sortedA.every((v, i) => v === sortedB[i]);
-}
-
-function cloneRouter(src) {
-  const out = {};
-  for (const [k, v] of Object.entries(src || {})) {
-    if (!v) continue;
-    const copy = {};
-    if (v.model_quality != null) copy.model_quality = v.model_quality;
-    if (Array.isArray(v.modalities)) copy.modalities = [...v.modalities];
-    if (Object.keys(copy).length > 0) out[k] = copy;
-  }
-  return out;
 }
 
 function markWeightsDirty(dirty) {
@@ -742,34 +738,22 @@ async function fetchWorkerWeights() {
   }
 }
 
-async function fetchWorkerRouter() {
-  try {
-    const res = await fetch("/api/scheduler/worker_router");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const router = await res.json();
-    state.workerRouter = cloneRouter(router);
-    state.workerRouterBaseline = cloneRouter(router);
-    renderWorkerTable();
-    markWeightsDirty(detectDirty());
-  } catch (e) {
-    setApplyStatus(`Failed to load worker_router: ${e.message || e}`, "error");
-  }
-}
-
 function renderWorkerTable() {
   if (!el.workerTableBody) return;
+  const locked = state.mode === "round_robin";
+  el.workerTableBody.classList.toggle("locked", locked);
   const workers = state.workers || [];
   if (workers.length === 0) {
-    el.workerTableBody.innerHTML = '<tr class="wt-empty"><td colspan="6">No workers registered.</td></tr>';
+    el.workerTableBody.innerHTML = '<tr class="wt-empty"><td colspan="4">No workers registered.</td></tr>';
     return;
   }
-  if (state.workerWeights === null || state.workerRouter === null) {
-    el.workerTableBody.innerHTML = '<tr class="wt-empty"><td colspan="6">Loading worker overrides…</td></tr>';
+  if (state.workerWeights === null) {
+    el.workerTableBody.innerHTML = '<tr class="wt-empty"><td colspan="4">Loading worker overrides…</td></tr>';
     return;
   }
   el.workerTableBody.innerHTML = "";
   for (const worker of workers) {
-    el.workerTableBody.appendChild(renderWorkerRow(worker));
+    el.workerTableBody.appendChild(renderWorkerRow(worker, locked));
   }
 }
 
@@ -784,28 +768,11 @@ function renderWorkerRow(worker) {
     ? Number(weightOverride)
     : weightBaseline;
 
-  const qualityBaseline = worker.model_quality != null ? Number(worker.model_quality) : 0.5;
-  const routerOverride = state.workerRouter[nodeId] || {};
-  const qualityOverride = routerOverride.model_quality;
-  const qualityEffective = qualityOverride != null ? Number(qualityOverride) : qualityBaseline;
-
-  const modalitiesBaseline = Array.isArray(worker.modalities) && worker.modalities.length > 0
-    ? worker.modalities
-    : ["text"];
-  const modalitiesOverride = routerOverride.modalities;
-  const modalitiesEffective = Array.isArray(modalitiesOverride) && modalitiesOverride.length > 0
-    ? modalitiesOverride
-    : modalitiesBaseline;
-
   const tr = document.createElement("tr");
   tr.dataset.node = nodeId;
 
   const baselineDirty = state.workerWeightsBaseline[nodeId];
-  const routerBaseline = state.workerRouterBaseline[nodeId] || {};
-  const dirty =
-    (weightOverride ?? null) !== (baselineDirty ?? null) ||
-    (qualityOverride ?? null) !== (routerBaseline.model_quality ?? null) ||
-    !modalitiesEqual(modalitiesOverride, routerBaseline.modalities);
+  const dirty = (weightOverride ?? null) !== (baselineDirty ?? null);
   if (dirty) tr.classList.add("row-dirty");
 
   tr.innerHTML = `
@@ -820,17 +787,6 @@ function renderWorkerRow(worker) {
       <div class="mini-slider">
         <input type="range" min="-1" max="1" step="0.01" value="${weightEffective}" data-bind="weight-range" />
         <span class="mini-value ${weightOverride !== undefined && weightOverride !== null ? "overridden" : "baseline"}" data-bind="weight-num">${weightEffective.toFixed(2)}</span>
-      </div>
-    </td>
-    <td class="wt-quality">
-      <div class="mini-slider">
-        <input type="range" min="0" max="1" step="0.01" value="${qualityEffective}" data-bind="quality-range" />
-        <span class="mini-value ${qualityOverride != null ? "overridden" : "baseline"}" data-bind="quality-num">${qualityEffective.toFixed(2)}</span>
-      </div>
-    </td>
-    <td class="wt-modalities">
-      <div class="modality-chips" data-bind="modalities">
-        ${MODALITY_OPTIONS.map((m) => `<span class="modality-chip ${modalitiesEffective.includes(m) ? "on" : ""}" data-mod="${m}">${m}</span>`).join("")}
       </div>
     </td>
     <td class="wt-actions">
@@ -856,67 +812,10 @@ function renderWorkerRow(worker) {
     markWeightsDirty(detectDirty());
   });
 
-  // Wire quality slider — anything other than the advertised baseline becomes
-  // an override; dragging back exactly to baseline clears the override.
-  const qualityRange = tr.querySelector("input[data-bind='quality-range']");
-  const qualityNum = tr.querySelector("[data-bind='quality-num']");
-  qualityRange.addEventListener("input", () => {
-    const v = clampRange(parseFloat(qualityRange.value), 0, 1);
-    const override = state.workerRouter[nodeId] || {};
-    if (Math.abs(v - qualityBaseline) < 1e-3) {
-      delete override.model_quality;
-      qualityNum.textContent = qualityBaseline.toFixed(2);
-      qualityNum.className = "mini-value baseline";
-    } else {
-      override.model_quality = v;
-      qualityNum.textContent = v.toFixed(2);
-      qualityNum.className = "mini-value overridden";
-    }
-    setRouterOverride(nodeId, override);
-    updateRowDirty(tr, nodeId);
-    markWeightsDirty(detectDirty());
-  });
-
-  // Wire modality chips.
-  const chipsEl = tr.querySelector("[data-bind='modalities']");
-  chipsEl.addEventListener("click", (e) => {
-    const chip = e.target.closest(".modality-chip");
-    if (!chip) return;
-    const mod = chip.dataset.mod;
-    const override = state.workerRouter[nodeId] || {};
-    const current = Array.isArray(override.modalities) && override.modalities.length > 0
-      ? [...override.modalities]
-      : [...modalitiesBaseline];
-    const idx = current.indexOf(mod);
-    if (idx >= 0) {
-      current.splice(idx, 1);
-    } else {
-      current.push(mod);
-    }
-    // A worker must always advertise at least one modality — empty is invalid.
-    if (current.length === 0) current.push("text");
-    if (modalitiesEqual(current, modalitiesBaseline)) {
-      delete override.modalities;
-    } else {
-      override.modalities = current;
-    }
-    setRouterOverride(nodeId, override);
-    // Re-render chips to reflect new state.
-    const updated = Array.isArray(override.modalities) && override.modalities.length > 0
-      ? override.modalities
-      : modalitiesBaseline;
-    chipsEl.innerHTML = MODALITY_OPTIONS.map((m) =>
-      `<span class="modality-chip ${updated.includes(m) ? "on" : ""}" data-mod="${m}">${m}</span>`,
-    ).join("");
-    updateRowDirty(tr, nodeId);
-    markWeightsDirty(detectDirty());
-  });
-
   // Per-row reset button.
   const resetBtn = tr.querySelector("[data-bind='reset']");
   resetBtn.addEventListener("click", () => {
     delete state.workerWeights[nodeId];
-    delete state.workerRouter[nodeId];
     renderWorkerTable();
     markWeightsDirty(detectDirty());
   });
@@ -924,31 +823,13 @@ function renderWorkerRow(worker) {
   return tr;
 }
 
-function setRouterOverride(nodeId, override) {
-  if (override && (override.model_quality != null || (Array.isArray(override.modalities) && override.modalities.length > 0))) {
-    state.workerRouter[nodeId] = override;
-  } else {
-    delete state.workerRouter[nodeId];
-  }
-}
-
 function updateRowDirty(tr, nodeId) {
   const weightBaseline = state.workerWeightsBaseline[nodeId];
-  const routerBaseline = state.workerRouterBaseline[nodeId] || {};
   const currentWeight = state.workerWeights[nodeId];
-  const currentRouter = state.workerRouter[nodeId] || {};
-  const dirty =
-    (currentWeight ?? null) !== (weightBaseline ?? null) ||
-    (currentRouter.model_quality ?? null) !== (routerBaseline.model_quality ?? null) ||
-    !modalitiesEqual(currentRouter.modalities, routerBaseline.modalities);
+  const dirty = (currentWeight ?? null) !== (weightBaseline ?? null);
   tr.classList.toggle("row-dirty", dirty);
   const resetBtn = tr.querySelector("[data-bind='reset']");
   if (resetBtn) resetBtn.disabled = !dirty;
-}
-
-function cssEscape(value) {
-  if (window.CSS && CSS.escape) return CSS.escape(value);
-  return String(value).replace(/['"\\]/g, "\\$&");
 }
 
 function clampRange(v, lo, hi) {
@@ -961,10 +842,10 @@ async function applyAllWeights() {
   setApplyStatus("applying…", "neutral");
   el.applyBtn.disabled = true;
   try {
-    const [w1, w2, w3] = await Promise.all([
+    const [w1, w2, m] = await Promise.all([
       applySchedulerWeights(),
       applyWorkerWeightOverrides(),
-      applyWorkerRouterOverrides(),
+      applySchedulerMode(),
     ]);
     if (w1) {
       state.weights = w1;
@@ -975,9 +856,10 @@ async function applyAllWeights() {
       state.workerWeights = { ...w2 };
       state.workerWeightsBaseline = { ...w2 };
     }
-    if (w3 !== null) {
-      state.workerRouter = cloneRouter(w3);
-      state.workerRouterBaseline = cloneRouter(w3);
+    if (m !== null) {
+      state.mode = m;
+      state.modeBaseline = m;
+      renderMode();
     }
     renderWorkerTable();
     markWeightsDirty(false);
@@ -986,6 +868,22 @@ async function applyAllWeights() {
     setApplyStatus(`Apply failed: ${e.message || e}`, "error");
     markWeightsDirty(true);
   }
+}
+
+async function applySchedulerMode() {
+  if (state.mode === null || state.modeBaseline === null) return null;
+  if (state.mode === state.modeBaseline) return null;
+  const res = await fetch("/api/scheduler/mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: state.mode }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.slice(0, 200) || `HTTP ${res.status}`);
+  }
+  const body = await res.json();
+  return typeof body.mode === "string" ? body.mode : null;
 }
 
 async function applySchedulerWeights() {
@@ -1023,47 +921,6 @@ async function applyWorkerWeightOverrides() {
   }
   if (!dirty) return null;
   const res = await fetch("/api/scheduler/worker_weights", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text.slice(0, 200) || `HTTP ${res.status}`);
-  }
-  return await res.json();
-}
-
-async function applyWorkerRouterOverrides() {
-  if (!state.workerRouter || !state.workerRouterBaseline) return null;
-  const payload = {};
-  const keys = new Set([
-    ...Object.keys(state.workerRouter),
-    ...Object.keys(state.workerRouterBaseline),
-  ]);
-  let dirty = false;
-  for (const key of keys) {
-    const current = state.workerRouter[key] || null;
-    const baseline = state.workerRouterBaseline[key] || null;
-    const currentQ = current ? current.model_quality ?? null : null;
-    const baselineQ = baseline ? baseline.model_quality ?? null : null;
-    const sameMods = modalitiesEqual(
-      current ? current.modalities : null,
-      baseline ? baseline.modalities : null,
-    );
-    if (currentQ === baselineQ && sameMods) continue;
-    if (current === null) {
-      payload[key] = null;
-    } else {
-      payload[key] = {
-        model_quality: currentQ,
-        modalities: current.modalities ?? null,
-      };
-    }
-    dirty = true;
-  }
-  if (!dirty) return null;
-  const res = await fetch("/api/scheduler/worker_router", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

@@ -799,6 +799,49 @@ body {
   flex-shrink: 0;
 }
 
+.mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-2);
+}
+
+.mode-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.mode-btn:hover {
+  color: var(--text);
+}
+
+.mode-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.mode-btn + .mode-btn {
+  border-left: 1px solid var(--border-strong);
+}
+
+.knob-row.locked .knob {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.knob.locked input[type="range"] {
+  cursor: not-allowed;
+}
+
 .settings-head-sticky {
   position: sticky;
   top: 0;
@@ -1004,12 +1047,10 @@ body {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.wt-id { width: 18%; }
-.wt-model { width: 18%; }
-.wt-weight { width: 18%; }
-.wt-quality { width: 18%; }
-.wt-modalities { width: 22%; }
-.wt-actions { width: 6%; text-align: right; }
+.wt-id { width: 30%; }
+.wt-model { width: 30%; }
+.wt-weight { width: 30%; }
+.wt-actions { width: 10%; text-align: right; }
 
 .wt-id-cell {
   display: flex;
@@ -1094,38 +1135,6 @@ body {
 .mini-value.baseline {
   color: var(--text-muted);
   font-weight: 400;
-}
-
-.modality-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.modality-chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 8px;
-  border-radius: 10px;
-  border: 1px solid var(--border-strong);
-  background: var(--bg-2);
-  color: var(--text-muted);
-  font-size: 10.5px;
-  letter-spacing: 0.04em;
-  cursor: pointer;
-  user-select: none;
-  transition: all 0.12s ease;
-}
-
-.modality-chip:hover {
-  border-color: var(--accent-line);
-  color: var(--text);
-}
-
-.modality-chip.on {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent);
 }
 
 .wt-reset {

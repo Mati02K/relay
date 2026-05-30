@@ -1,21 +1,14 @@
-"""Modality detection and worker-capability filtering.
+"""Input-modality detection for OpenAI-style chat requests.
 
-A vision-capable worker should serve image+text prompts; a text-only
-worker should not. This module gives the scheduler the two primitives
-it needs to enforce that:
+This module owns the *hard* input-modality constraint only: detecting
+that a request contains image / audio / video parts so the scheduler
+can reject it on workers whose chart entry doesn't include the
+corresponding ``input_modalities`` flag.
 
-* :func:`detect_request_modalities` — walk an OpenAI-style request body
-  and return the set of modalities it contains
-* :func:`worker_supports_modalities` — read a worker's advertised
-  capability set and check whether it covers every required modality
-
-Workers self-advertise their modality set via metadata, typically via
-the ``RELAY_MODALITIES`` environment variable at registration time
-(comma-separated, e.g. ``RELAY_MODALITIES=text,image``).
-
-The classifier deliberately defaults to ``{"text"}`` for both an
-unannotated request and an unannotated worker so that any existing
-worker that pre-dates this module keeps serving text requests.
+Skill specialization (coding / reasoning / chat) is detected by
+:mod:`coordinator.router.classifier` and applied as a *soft* preference
+in the scheduler. Worker-advertised modality lists are no longer
+honoured — capabilities come from the model chart.
 """
 
 from __future__ import annotations
@@ -24,7 +17,6 @@ from collections.abc import Mapping
 from typing import Any
 
 DEFAULT_REQUEST_MODALITIES: frozenset[str] = frozenset({"text"})
-DEFAULT_WORKER_MODALITIES: frozenset[str] = frozenset({"text"})
 
 # OpenAI-style content-part `type` values, grouped by modality. Anything
 # unknown falls through to ``"text"`` so a new content type cannot
@@ -51,7 +43,7 @@ _VIDEO_CONTENT_TYPES = frozenset(
 
 
 def detect_request_modalities(request: Mapping[str, Any]) -> set[str]:
-    """Return the modalities present in an OpenAI-style chat request.
+    """Return the input modalities present in an OpenAI-style chat request.
 
     Text is always included so a plain-text request resolves to
     ``{"text"}``. Image, audio, and video parts add their own keys.
@@ -79,30 +71,3 @@ def detect_request_modalities(request: Mapping[str, Any]) -> set[str]:
                 elif part_type in _VIDEO_CONTENT_TYPES:
                     modalities.add("video")
     return modalities
-
-
-def worker_modalities(metadata: dict[str, Any]) -> set[str]:
-    """Return the modality set a worker advertises.
-
-    Accepts either ``modalities`` (preferred) or ``capabilities`` as a
-    list of strings. Falls back to :data:`DEFAULT_WORKER_MODALITIES`
-    when neither is present so existing workers keep working.
-    """
-    for key in ("modalities", "capabilities"):
-        raw = metadata.get(key)
-        if isinstance(raw, list):
-            normalised = {str(item).strip().lower() for item in raw if item}
-            normalised.discard("")
-            if normalised:
-                return normalised
-    return set(DEFAULT_WORKER_MODALITIES)
-
-
-def worker_supports_modalities(
-    metadata: dict[str, Any],
-    required: set[str],
-) -> bool:
-    """Return ``True`` iff the worker advertises every required modality."""
-    if not required:
-        return True
-    return required.issubset(worker_modalities(metadata))

@@ -211,11 +211,27 @@ async def chatCompletions(request: Request) -> StreamingResponse:
         attempts,
     )
 
+    routing_decision = json.dumps(
+        {
+            "worker": choice.worker.node_id,
+            "model": choice.model_id,
+            "skills_needed": sorted(choice.skills_needed),
+            "skills_available": sorted(choice.skills_available),
+            "skill_match": choice.skill_match,
+            "complexity": round(choice.complexity, 4),
+            "model_quality": round(choice.model_quality, 4),
+            "quality_term": round(choice.quality_term, 4),
+            "cost": round(choice.cost, 4),
+        },
+        separators=(",", ":"),
+    )
+
     return StreamingResponse(
         _streamWorkerResponse(opened.client, opened.stream_ctx, opened.upstream),
         media_type="text/event-stream",
         headers={
             "X-Relay-Worker": choice.worker.node_id,
+            "X-Relay-Model": choice.model_id,
             "X-Relay-Cost": f"{choice.cost:.4f}",
             "X-Relay-Matched-Tokens": str(choice.matched_tokens),
             "X-Relay-Prompt-Tokens": str(choice.prompt_tokens),
@@ -223,12 +239,19 @@ async def chatCompletions(request: Request) -> StreamingResponse:
             "X-Relay-Complexity": f"{choice.complexity:.4f}",
             "X-Relay-Model-Quality": f"{choice.model_quality:.4f}",
             "X-Relay-Quality-Term": f"{choice.quality_term:.4f}",
+            "X-Relay-Skills-Needed": ",".join(sorted(choice.skills_needed)),
+            "X-Relay-Skills-Available": ",".join(sorted(choice.skills_available)),
+            "X-Relay-Skill-Match": "true" if choice.skill_match else "false",
+            "X-Relay-Routing-Decision": routing_decision,
             "X-Relay-Attempts": str(attempts),
             "Access-Control-Expose-Headers": (
-                "X-Relay-Worker, X-Relay-Cost, X-Relay-Matched-Tokens, "
-                "X-Relay-Prompt-Tokens, X-Relay-Overlap, "
-                "X-Relay-Complexity, X-Relay-Model-Quality, "
-                "X-Relay-Quality-Term, X-Relay-Attempts"
+                "X-Relay-Worker, X-Relay-Model, X-Relay-Cost, "
+                "X-Relay-Matched-Tokens, X-Relay-Prompt-Tokens, "
+                "X-Relay-Overlap, X-Relay-Complexity, "
+                "X-Relay-Model-Quality, X-Relay-Quality-Term, "
+                "X-Relay-Skills-Needed, X-Relay-Skills-Available, "
+                "X-Relay-Skill-Match, X-Relay-Routing-Decision, "
+                "X-Relay-Attempts"
             ),
         },
     )
@@ -290,15 +313,46 @@ async def listWorkers() -> list[dict[str, Any]]:
             "engines": worker.metadata.get("engines", []),
             "weight": worker.metadata.get("weight", 0.0),
             "weight_override": scheduler_module.WORKER_WEIGHT_OVERRIDES.get(worker.node_id),
-            "model_quality": worker.metadata.get("model_quality"),
-            "modalities": worker.metadata.get("modalities"),
-            "router_override": scheduler_module.WORKER_ROUTER_OVERRIDES.get(worker.node_id),
             "healthy": health_by_node.get(worker.node_id, {}).get("healthy", False),
             "health": health_by_node.get(worker.node_id, _unknown_worker_health()),
             "telemetry": worker.telemetry.model_dump(),
         }
         for worker in workers
     ]
+
+
+@app.get("/v1/scheduler/mode")
+async def getSchedulerMode() -> dict[str, str]:
+    """Return the current scheduler mode (``cost`` or ``round_robin``)."""
+    _requireActive()
+    return {"mode": scheduler_module.get_mode()}
+
+
+@app.post("/v1/scheduler/mode")
+async def setSchedulerMode(payload: dict[str, str]) -> dict[str, str]:
+    """Switch the scheduler mode at runtime.
+
+    Body: ``{"mode": "cost"}`` or ``{"mode": "round_robin"}``. Cost mode runs
+    the full paper cost formula plus the chart-driven router; round-robin
+    bypasses scoring and rotates across model + input-modality eligible
+    workers in stable node-id order. The change takes effect on the next
+    request and is not persisted across coordinator restarts.
+    """
+    _requireActive()
+    if not isinstance(payload, dict) or "mode" not in payload:
+        raise HTTPException(
+            status_code=400,
+            detail='Body must be a JSON object with a "mode" field',
+        )
+    raw = payload["mode"]
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail="'mode' must be a string")
+    try:
+        new_mode = scheduler_module.set_mode(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    logger.info("Scheduler mode set | mode={}", new_mode)
+    return {"mode": new_mode}
 
 
 @app.get("/v1/scheduler/weights")
@@ -310,15 +364,16 @@ async def getSchedulerWeights() -> dict[str, float]:
 
 # Allowed ranges for each weight in POST /v1/scheduler/weights. The base
 # 5 stay in [0, 1] to match the paper-style cost terms; ``nu`` is the
-# RouteLLM quality knob and the ablation in SCHEDULER.md uses nu=5 and
-# nu=20 as its operating points.
+# RouteLLM quality knob. We cap nu at 5.0 — below the paper's nu=20
+# operating point — because our complexity classifier is a heuristic and
+# a smaller ceiling stops misclassifications from dominating the cost.
 _WEIGHT_BOUNDS: dict[str, tuple[float, float]] = {
     "queue": (0.0, 1.0),
     "prefix_miss": (0.0, 1.0),
     "memory": (0.0, 1.0),
     "jitter": (0.0, 1.0),
     "thermal": (0.0, 1.0),
-    "nu": (0.0, 20.0),
+    "nu": (0.0, 5.0),
 }
 
 
@@ -328,8 +383,7 @@ async def setSchedulerWeights(payload: dict[str, float]) -> dict[str, float]:
 
     Accepts a partial JSON body — only the keys present are updated. The base
     5 weights must be floats in ``[0.0, 1.0]``; ``nu`` (RouteLLM quality knob)
-    is allowed up to ``20.0``, matching the operating points used in
-    SCHEDULER.md (``nu=5`` and ``nu=20``). Returns the post-update snapshot.
+    is allowed up to ``5.0``. Returns the post-update snapshot.
     """
     _requireActive()
     if not isinstance(payload, dict):
@@ -404,113 +458,6 @@ async def setWorkerWeightOverrides(payload: dict[str, Any]) -> dict[str, float]:
         scheduler_module.WORKER_WEIGHT_OVERRIDES[node_id] = value
     overrides = dict(scheduler_module.WORKER_WEIGHT_OVERRIDES)
     logger.info("Worker weight overrides updated | {}", overrides)
-    return overrides
-
-
-_KNOWN_MODALITIES: frozenset[str] = frozenset({"text", "image", "audio", "video"})
-
-
-@app.get("/v1/scheduler/worker_router")
-async def getWorkerRouterOverrides() -> dict[str, dict[str, Any]]:
-    """Return the active per-worker router overrides (model_quality, modalities)."""
-    _requireActive()
-    return {
-        node_id: dict(override)
-        for node_id, override in scheduler_module.WORKER_ROUTER_OVERRIDES.items()
-    }
-
-
-@app.post("/v1/scheduler/worker_router")
-async def setWorkerRouterOverrides(
-    payload: dict[str, Any],
-) -> dict[str, dict[str, Any]]:
-    """Replace per-worker router overrides (``model_quality``, ``modalities``).
-
-    Body is a partial JSON object keyed by node id. Each value is either:
-
-    * ``null`` — clear all overrides for that worker (fall back to its
-      advertised metadata)
-    * an object with optional ``model_quality`` (float ``[0.0, 1.0]``) and
-      ``modalities`` (list of strings drawn from
-      ``{"text", "image", "audio", "video"}``); a key set to ``null`` inside
-      the object clears just that field
-
-    Like :func:`setWorkerWeightOverrides`, the change is in-memory and takes
-    effect on the next routing decision.
-    """
-    _requireActive()
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Body must be a JSON object of node_id -> overrides",
-        )
-    for node_id, raw_value in payload.items():
-        if not isinstance(node_id, str) or not node_id:
-            raise HTTPException(status_code=400, detail=f"Invalid node id: {node_id!r}")
-        if raw_value is None:
-            scheduler_module.WORKER_ROUTER_OVERRIDES.pop(node_id, None)
-            continue
-        if not isinstance(raw_value, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Override for '{node_id}' must be a JSON object or null",
-            )
-        current = dict(scheduler_module.WORKER_ROUTER_OVERRIDES.get(node_id, {}))
-        if "model_quality" in raw_value:
-            mq = raw_value["model_quality"]
-            if mq is None:
-                current.pop("model_quality", None)
-            else:
-                try:
-                    quality = float(mq)
-                except (TypeError, ValueError) as e:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"model_quality for '{node_id}' must be a number (got {mq!r})",
-                    ) from e
-                if not 0.0 <= quality <= 1.0:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"model_quality for '{node_id}' must be in [0.0, 1.0] (got {quality})"
-                        ),
-                    )
-                current["model_quality"] = quality
-        if "modalities" in raw_value:
-            mods = raw_value["modalities"]
-            if mods is None:
-                current.pop("modalities", None)
-            else:
-                if not isinstance(mods, list) or not all(isinstance(m, str) for m in mods):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"modalities for '{node_id}' must be a list of strings",
-                    )
-                normalised = [m.strip().lower() for m in mods if m and m.strip()]
-                bad = [m for m in normalised if m not in _KNOWN_MODALITIES]
-                if bad:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"modalities for '{node_id}' contained unknown values {bad}; "
-                            f"allowed: {sorted(_KNOWN_MODALITIES)}"
-                        ),
-                    )
-                if not normalised:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"modalities for '{node_id}' must contain at least one modality",
-                    )
-                current["modalities"] = normalised
-        if current:
-            scheduler_module.WORKER_ROUTER_OVERRIDES[node_id] = current
-        else:
-            scheduler_module.WORKER_ROUTER_OVERRIDES.pop(node_id, None)
-    overrides = {
-        node_id: dict(override)
-        for node_id, override in scheduler_module.WORKER_ROUTER_OVERRIDES.items()
-    }
-    logger.info("Worker router overrides updated | {}", overrides)
     return overrides
 
 

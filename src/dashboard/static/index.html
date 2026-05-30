@@ -131,10 +131,15 @@
               <div class="settings-title">Scheduler cost weights</div>
               <div class="settings-sub">
                 Hot-applied. Six terms add into <code>cost(w, r)</code>; lower wins.
-                Base 5 are <code>[0,1]</code>; <code>nu</code> is <code>[0,20]</code>.
+                Base 5 are <code>[0,1]</code>; <code>nu</code> is <code>[0,5]</code>.
+                Round-robin mode disables all cost scoring.
               </div>
             </div>
             <div class="settings-actions">
+              <div class="mode-toggle" id="mode-toggle" role="group" aria-label="Scheduler mode">
+                <button type="button" class="mode-btn" data-mode="cost">cost</button>
+                <button type="button" class="mode-btn" data-mode="round_robin">round-robin</button>
+              </div>
               <button id="reset-btn" class="ghost-btn" type="button">Reset</button>
               <button id="apply-btn" class="send-btn" type="button" disabled>Apply</button>
             </div>
@@ -146,12 +151,12 @@
 
           <header class="settings-head settings-head-thin">
             <div>
-              <div class="settings-title">Per-worker routing</div>
+              <div class="settings-title">Per-worker preference</div>
               <div class="settings-sub">
                 One row per registered worker. <code>weight</code> subtracts
-                from the cost, <code>quality</code> drives the <code>nu</code>
-                term, <code>modalities</code> filter eligibility. Empty cell
-                falls back to the worker's advertised baseline.
+                from the cost so positive values bias the scheduler toward
+                that worker. Model skill and quality are chart-driven and
+                read-only here.
               </div>
             </div>
           </header>
@@ -163,13 +168,11 @@
                   <th class="wt-id">worker</th>
                   <th class="wt-model">model</th>
                   <th class="wt-weight">weight <span class="th-range">[-1, 1]</span></th>
-                  <th class="wt-quality">quality <span class="th-range">[0, 1]</span></th>
-                  <th class="wt-modalities">modalities</th>
                   <th class="wt-actions"></th>
                 </tr>
               </thead>
               <tbody id="worker-table-body">
-                <tr class="wt-empty"><td colspan="6">Loading workers…</td></tr>
+                <tr class="wt-empty"><td colspan="4">Loading workers…</td></tr>
               </tbody>
             </table>
           </div>

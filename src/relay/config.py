@@ -61,8 +61,11 @@ class SchedulerConfig(BaseModel):
     Each weight scales one signal that contributes to a worker's cost; the
     scheduler picks the lowest-cost worker. The base 5 weights are bounded
     to ``[0.0, 1.0]``; ``nu`` (RouteLLM quality term) is bounded to
-    ``[0.0, 20.0]``, matching the operating points in SCHEDULER.md
-    (``nu=5`` and ``nu=20``).
+    ``[0.0, 5.0]``. The ceiling is below the RouteLLM paper's nu=20
+    operating point because our complexity classifier is heuristic — a
+    smaller cap keeps misclassifications from dominating the cost. nu=0
+    disables the chart entirely (no skill filter, no quality term);
+    nu=2-3 is a good default with this classifier.
 
     The six weights map to the cost terms in ``src/coordinator/scheduler.py``:
 
@@ -80,10 +83,7 @@ class SchedulerConfig(BaseModel):
     memory: float = Field(default=1.0, ge=0.0, le=1.0)
     jitter: float = Field(default=1.0, ge=0.0, le=1.0)
     thermal: float = Field(default=1.0, ge=0.0, le=1.0)
-    nu: float = Field(default=0.0, ge=0.0, le=20.0)
-
-
-KNOWN_MODALITIES: tuple[str, ...] = ("text", "image", "audio", "video")
+    nu: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
 class WorkerConfig(BaseModel):
@@ -93,8 +93,6 @@ class WorkerConfig(BaseModel):
     port: int = 9090
     coordinator_url: str | None = None
     weight: float = Field(default=0.0, ge=-1.0, le=1.0)
-    model_quality: float = Field(default=0.5, ge=0.0, le=1.0)
-    modalities: list[str] = Field(default_factory=lambda: ["text"])
 
 
 class EngineConfig(BaseModel):

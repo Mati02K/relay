@@ -148,30 +148,30 @@ async def set_worker_weights(request: Request) -> dict[str, float]:
     return {k: float(v) for k, v in payload.items()}
 
 
-@app.get("/api/scheduler/worker_router")
-async def get_worker_router(request: Request) -> dict[str, dict[str, Any]]:
-    """Proxy the coordinator's per-worker router overrides (quality + modalities)."""
+@app.get("/api/scheduler/mode")
+async def get_scheduler_mode(request: Request) -> dict[str, str]:
+    """Proxy the coordinator's scheduler mode (cost / round_robin)."""
     client: httpx.AsyncClient = request.app.state.http
     try:
-        response = await client.get(f"{coordinator_url()}/v1/scheduler/worker_router")
+        response = await client.get(f"{coordinator_url()}/v1/scheduler/mode")
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Coordinator unreachable: {e}") from e
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail=response.text[:500])
     payload = response.json()
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="Unexpected worker_router payload")
-    return {k: v for k, v in payload.items() if isinstance(v, dict)}
+    if not isinstance(payload, dict) or "mode" not in payload:
+        raise HTTPException(status_code=502, detail="Unexpected mode payload")
+    return {"mode": str(payload["mode"])}
 
 
-@app.post("/api/scheduler/worker_router")
-async def set_worker_router(request: Request) -> dict[str, dict[str, Any]]:
-    """Forward per-worker router overrides from the Settings view."""
+@app.post("/api/scheduler/mode")
+async def set_scheduler_mode(request: Request) -> dict[str, str]:
+    """Forward a scheduler mode switch from the Settings toggle."""
     body = await request.json()
     client: httpx.AsyncClient = request.app.state.http
     try:
         response = await client.post(
-            f"{coordinator_url()}/v1/scheduler/worker_router",
+            f"{coordinator_url()}/v1/scheduler/mode",
             json=body,
         )
     except httpx.RequestError as e:
@@ -179,9 +179,9 @@ async def set_worker_router(request: Request) -> dict[str, dict[str, Any]]:
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail=response.text[:500])
     payload = response.json()
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="Unexpected worker_router payload")
-    return {k: v for k, v in payload.items() if isinstance(v, dict)}
+    if not isinstance(payload, dict) or "mode" not in payload:
+        raise HTTPException(status_code=502, detail="Unexpected mode payload")
+    return {"mode": str(payload["mode"])}
 
 
 @app.get("/api/workers")
