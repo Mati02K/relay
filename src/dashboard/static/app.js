@@ -577,24 +577,30 @@ function wireSettings() {
       if (!next || next === state.mode) return;
       state.mode = next;
       renderMode();
+      renderWeights();
+      renderWorkerTable();
       markWeightsDirty(detectDirty());
     });
   }
 }
 
 function resetAllDirty() {
+  // Reset mode first so the downstream renders pick up the correct
+  // locked/unlocked state in one pass instead of flashing through stale
+  // locked knobs before they unlock.
+  if (state.modeBaseline !== null) {
+    state.mode = state.modeBaseline;
+  }
   if (state.weightsBaseline) {
     state.weights = { ...state.weightsBaseline };
-    renderWeights();
   }
   if (state.workerWeightsBaseline) {
     state.workerWeights = { ...state.workerWeightsBaseline };
   }
-  if (state.modeBaseline !== null) {
-    state.mode = state.modeBaseline;
-    renderMode();
-  }
+  renderMode();
+  renderWeights();
   renderWorkerTable();
+  setApplyStatus("reset to last applied values.", "neutral");
   markWeightsDirty(false);
 }
 
@@ -666,7 +672,6 @@ function renderMode() {
     btn.classList.toggle("active", isActive);
     btn.setAttribute("aria-pressed", isActive ? "true" : "false");
   }
-  if (state.mode !== null) renderWeights();
 }
 
 async function fetchSchedulerMode() {
@@ -678,6 +683,8 @@ async function fetchSchedulerMode() {
     state.mode = mode;
     state.modeBaseline = mode;
     renderMode();
+    renderWeights();
+    renderWorkerTable();
     markWeightsDirty(detectDirty());
   } catch (e) {
     setApplyStatus(`Failed to load scheduler mode: ${e.message || e}`, "error");
@@ -757,7 +764,7 @@ function renderWorkerTable() {
   }
 }
 
-function renderWorkerRow(worker) {
+function renderWorkerRow(worker, locked = false) {
   const nodeId = worker.node_id;
   const stateLevel = workerState(worker);
   const modelId = ((worker.models && worker.models[0]) || {}).id || "—";
@@ -774,7 +781,9 @@ function renderWorkerRow(worker) {
   const baselineDirty = state.workerWeightsBaseline[nodeId];
   const dirty = (weightOverride ?? null) !== (baselineDirty ?? null);
   if (dirty) tr.classList.add("row-dirty");
+  if (locked) tr.classList.add("row-locked");
 
+  const resetDisabled = !dirty || locked;
   tr.innerHTML = `
     <td class="wt-id">
       <div class="wt-id-cell">
@@ -785,14 +794,16 @@ function renderWorkerRow(worker) {
     <td class="wt-model"><span class="wt-model-cell" title="${escapeHtml(modelId)}">${escapeHtml(modelId)}</span></td>
     <td class="wt-weight">
       <div class="mini-slider">
-        <input type="range" min="-1" max="1" step="0.01" value="${weightEffective}" data-bind="weight-range" />
+        <input type="range" min="-1" max="1" step="0.01" value="${weightEffective}" data-bind="weight-range" ${locked ? "disabled" : ""} />
         <span class="mini-value ${weightOverride !== undefined && weightOverride !== null ? "overridden" : "baseline"}" data-bind="weight-num">${weightEffective.toFixed(2)}</span>
       </div>
     </td>
     <td class="wt-actions">
-      <button type="button" class="wt-reset" data-bind="reset" ${dirty ? "" : "disabled"}>reset</button>
+      <button type="button" class="wt-reset" data-bind="reset" ${resetDisabled ? "disabled" : ""}>reset</button>
     </td>
   `;
+
+  if (locked) return tr;
 
   // Wire weight slider.
   const weightRange = tr.querySelector("input[data-bind='weight-range']");

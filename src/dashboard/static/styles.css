@@ -842,6 +842,15 @@ body {
   cursor: not-allowed;
 }
 
+.worker-table tbody.locked tr.row-locked {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.worker-table tbody.locked tr.row-locked .wt-reset {
+  cursor: not-allowed;
+}
+
 .settings-head-sticky {
   position: sticky;
   top: 0;

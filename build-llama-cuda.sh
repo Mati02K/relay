@@ -2,7 +2,8 @@
 # Build llama.cpp from source with CUDA enabled and point Relay at it.
 #
 # Usage:
-#   ./build-llama-cuda.sh
+#   ./build-llama-cuda.sh            # skips build if binary already exists
+#   ./build-llama-cuda.sh --rebuild  # force full rebuild from source
 #
 # What it does:
 #   1. Checks required tools are installed (git, cmake, nvcc, python3).
@@ -149,7 +150,24 @@ step_summary() {
 }
 
 main() {
+    local force_rebuild=0
+    for arg in "$@"; do
+        case "$arg" in
+            --rebuild) force_rebuild=1 ;;
+        esac
+    done
+
     step_check_prereqs
+
+    if [ "$force_rebuild" -eq 0 ] && [ -x "$BIN_PATH" ]; then
+        info "Binary already exists at $BIN_PATH — skipping build"
+        info "Run with --rebuild to force a full rebuild from source"
+        step_verify
+        step_update_config
+        step_summary
+        return
+    fi
+
     step_prepare_dirs
     step_clone_or_update
     step_configure

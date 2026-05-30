@@ -38,3 +38,7 @@ src/membership/etcd-go/membership-etcd
 
 # Local stress / diagnostic scripts
 test/stress_thermal.py
+
+# Test framework — generated data and results
+test/data/
+test/results/
