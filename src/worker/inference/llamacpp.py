@@ -21,10 +21,6 @@ from worker.inference.base import (
 )
 
 _DEFAULT_PORT = 9081
-_METRICS_CANDIDATES_KV: tuple[str, ...] = (
-    "llamacpp:kv_cache_usage_ratio",
-    "llamacpp_kv_cache_usage_ratio",
-)
 _METRICS_CANDIDATES_Q: tuple[str, ...] = (
     "llamacpp:requests_processing",
     "llamacpp_requests_processing",
@@ -43,8 +39,11 @@ class LlamaCppEngine(InferenceEngine):
         server_binary: str | None = None,
         extra_args: list[str] | None = None,
         n_gpu_layers: int = -1,  # All to GPU
-        n_ctx: int = 4096,  # Context window
+        n_ctx: int | None = None,  # Total context window (divided across slots)
         n_threads: int | None = None,  # CPU threads
+        n_parallel: int | None = None,  # Concurrent inference slots
+        n_threads_http: int | None = None,  # HTTP server worker threads
+        cont_batching: bool | None = None,  # Continuous batching across slots
         verbose: bool = False,  # Less spam
     ) -> None:
         self._model_path: str = (
@@ -65,8 +64,21 @@ class LlamaCppEngine(InferenceEngine):
 
         cpu_count = os.cpu_count() or 1
         self._n_gpu_layers = n_gpu_layers
-        self._n_ctx = n_ctx
+        self._n_ctx = n_ctx if n_ctx is not None else int(os.getenv("LLAMA_N_CTX", "16384"))
         self._n_threads = n_threads if n_threads is not None else max(1, cpu_count // 2)
+        self._n_parallel = (
+            n_parallel if n_parallel is not None else int(os.getenv("LLAMA_N_PARALLEL", "4"))
+        )
+        self._n_threads_http = (
+            n_threads_http
+            if n_threads_http is not None
+            else int(os.getenv("LLAMA_N_THREADS_HTTP", "8"))
+        )
+        self._cont_batching = (
+            cont_batching
+            if cont_batching is not None
+            else os.getenv("LLAMA_CONT_BATCHING", "1") not in ("0", "false", "False")
+        )
         self._verbose = verbose
 
         self._proc: asyncio.subprocess.Process | None = None
@@ -136,7 +148,13 @@ class LlamaCppEngine(InferenceEngine):
                 str(self._n_ctx),
                 "-t",
                 str(self._n_threads or os.cpu_count()),
+                "--parallel",
+                str(self._n_parallel),
+                "--threads-http",
+                str(self._n_threads_http),
             ]
+            if self._cont_batching:
+                args.append("--cont-batching")
             args.extend(self._extra_args)
 
             logger.info("Starting llama-server | cmd={}", " ".join(args))
@@ -154,8 +172,7 @@ class LlamaCppEngine(InferenceEngine):
                     err = await self._drain_stderr_tail()
                     await self._stop_locked()
                     raise RuntimeError(
-                        f"llama-server exited during startup code={code}. "
-                        f"stderr_tail={err!r}"
+                        f"llama-server exited during startup code={code}. stderr_tail={err!r}"
                     )
                 health = await self.health()
                 if health.status:
@@ -239,22 +256,20 @@ class LlamaCppEngine(InferenceEngine):
     async def get_engine_telemetry(self) -> EngineReportedTelemetry:
         client = self._http
         if not client:
-            return EngineReportedTelemetry(qw=0, mw=0.0)
+            return EngineReportedTelemetry(qw=0)
 
         try:
             response = await client.get("/metrics")
         except httpx.RequestError:
-            return EngineReportedTelemetry(qw=0, mw=0.0)
+            return EngineReportedTelemetry(qw=0)
 
         if response.status_code != 200:
-            return EngineReportedTelemetry(qw=0, mw=0.0)
+            return EngineReportedTelemetry(qw=0)
 
         samples = parse_prometheus_samples(response.text)
         qv = find_metric(samples, *_METRICS_CANDIDATES_Q)
-        kv = find_metric(samples, *_METRICS_CANDIDATES_KV)
         qw = int(qv) if qv is not None else 0
-        mw = max(0.0, min(1.0, float(kv))) if kv is not None else 0.0
-        return EngineReportedTelemetry(qw=qw, mw=mw)
+        return EngineReportedTelemetry(qw=qw)
 
     async def generate(self, request: Mapping[str, object]) -> AsyncIterator[str]:
         await self.start()

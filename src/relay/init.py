@@ -215,7 +215,7 @@ def _configure_scheduler(config: RelayConfig, options: InitOptions) -> RelayConf
 
     print(
         "Pick a weight per signal. Base weights are [0.0, 1.0] (1.0 = full "
-        "influence, 0.0 = signal off). nu is [0.0, 50.0] (0 disables "
+        "influence, 0.0 = signal off). nu is [0.0, 20.0] (0 disables "
         "quality routing; SCHEDULER.md uses nu=5 and nu=20)."
     )
     print("Enter to keep the current value.")
@@ -243,10 +243,10 @@ def _configure_scheduler(config: RelayConfig, options: InitOptions) -> RelayConf
         nu=nu_override
         if nu_override is not None
         else _prompt_float(
-            "nu (RouteLLM quality routing; 0 to disable, 5–20 typical)",
+            "nu (RouteLLM quality routing; 0 to disable, 5 or 20 typical)",
             default=current.nu,
             lo=0.0,
-            hi=50.0,
+            hi=20.0,
         ),
     )
     return config.model_copy(update={"scheduler": weights})
@@ -256,8 +256,8 @@ def _validated_nu(flag_value: float | None) -> float | None:
     """Validate a ``--nu`` CLI flag value and raise on out-of-range input."""
     if flag_value is None:
         return None
-    if not 0.0 <= flag_value <= 50.0:
-        raise ConfigError(f"nu must be between 0.0 and 50.0 (got {flag_value})")
+    if not 0.0 <= flag_value <= 20.0:
+        raise ConfigError(f"nu must be between 0.0 and 20.0 (got {flag_value})")
     return flag_value
 
 

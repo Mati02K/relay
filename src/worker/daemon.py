@@ -16,6 +16,7 @@ from membership.base import MembershipLayer
 from membership.etcd import EtcdMembership
 from network import NetworkLayer, build_network
 from telemetry.request_metrics import extract_usage_prompt_tokens
+from telemetry.memory import MemoryAggregator, detect_memory_collectors
 from telemetry.schemas import SystemTelemetry, ThermalSourceTelemetry, ThermalTelemetry
 from telemetry.state import WorkerTelemetryState
 from telemetry.thermal import ThermalAggregator, detect_thermal_collectors
@@ -25,7 +26,17 @@ from worker.inference.llamacpp import LlamaCppEngine
 WORKER_METADATA_KEY_PREFIX = "/relay/workers"
 TELEMETRY_INTERVAL_SECONDS = 0.2
 THERMAL_INTERVAL_SECONDS = float(os.getenv("RELAY_THERMAL_INTERVAL_SECONDS", "5.0"))
+MEMORY_INTERVAL_SECONDS = float(os.getenv("RELAY_MEMORY_INTERVAL_SECONDS", "5.0"))
 WORKER_LEASE_TTL_SECONDS = int(os.getenv("RELAY_WORKER_LEASE_TTL_SECONDS", "10"))
+ENGINE_SUPERVISOR_INTERVAL_SECONDS = float(
+    os.getenv("RELAY_ENGINE_SUPERVISOR_INTERVAL_SECONDS", "2.0")
+)
+ENGINE_RESTART_INITIAL_BACKOFF_SECONDS = float(
+    os.getenv("RELAY_ENGINE_RESTART_INITIAL_BACKOFF_SECONDS", "2.0")
+)
+ENGINE_RESTART_MAX_BACKOFF_SECONDS = float(
+    os.getenv("RELAY_ENGINE_RESTART_MAX_BACKOFF_SECONDS", "30.0")
+)
 
 
 class WorkerDaemon:
@@ -46,8 +57,11 @@ class WorkerDaemon:
         inference_engine: InferenceEngine,
         telemetry: WorkerTelemetryState | None = None,
         thermal: ThermalAggregator | None = None,
+        memory: MemoryAggregator | None = None,
         telemetry_interval_seconds: float = TELEMETRY_INTERVAL_SECONDS,
         thermal_interval_seconds: float = THERMAL_INTERVAL_SECONDS,
+        memory_interval_seconds: float = MEMORY_INTERVAL_SECONDS,
+        engine_supervisor_interval_seconds: float = ENGINE_SUPERVISOR_INTERVAL_SECONDS,
         weight: float = 0.0,
     ) -> None:
         self.node_id = node_id
@@ -61,8 +75,15 @@ class WorkerDaemon:
             detect_thermal_collectors(uses_gpu=inference_engine.uses_gpu),
             primary_device="gpu" if inference_engine.uses_gpu else "cpu",
         )
+        self.memory = memory or MemoryAggregator(
+            detect_memory_collectors(uses_gpu=inference_engine.uses_gpu),
+            primary_device="gpu" if inference_engine.uses_gpu else "cpu",
+        )
         self.telemetry_interval_seconds = telemetry_interval_seconds
         self.thermal_interval_seconds = max(0.5, thermal_interval_seconds)
+        self.memory_interval_seconds = max(0.5, memory_interval_seconds)
+        self.engine_supervisor_interval_seconds = max(0.5, engine_supervisor_interval_seconds)
+        self._engine_supervised = False
         self._tasks: list[asyncio.Task[None]] = []
 
     @classmethod
@@ -106,6 +127,7 @@ class WorkerDaemon:
         models = _worker_models()
         if models:
             await self.ensure_ready()
+            self._engine_supervised = True
 
         telemetry = await self.telemetry.snapshot()
         metadata: dict[str, Any] = {
@@ -126,11 +148,15 @@ class WorkerDaemon:
         await self.membership.putWithLease(self._metadata_key(), json.dumps(metadata))
         self._tasks.append(asyncio.create_task(self._publish_telemetry_loop()))
         self._tasks.append(asyncio.create_task(self._collect_thermal_loop()))
+        self._tasks.append(asyncio.create_task(self._collect_memory_loop()))
+        if self._engine_supervised:
+            self._tasks.append(asyncio.create_task(self._engine_supervisor_loop()))
         logger.info(
-            "Worker daemon started | nodeId={} addr={} thermalCollectors={}",
+            "Worker daemon started | nodeId={} addr={} thermalCollectors={} memoryCollectors={}",
             self.node_id,
             self.address,
             self.thermal.collector_names,
+            self.memory.collector_names,
         )
 
     async def stop(self) -> None:
@@ -140,6 +166,7 @@ class WorkerDaemon:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.thermal.close()
+        await self.memory.close()
         await self.inference_engine.stop()
         await self.membership.deregister(self.node_id)
         await self.membership.close()
@@ -228,9 +255,54 @@ class WorkerDaemon:
                 logger.exception("Thermal collection failed | nodeId={}", self.node_id)
             await asyncio.sleep(self.thermal_interval_seconds)
 
+    async def _collect_memory_loop(self) -> None:
+        while True:
+            try:
+                snapshot = await self.memory.sample()
+                await self.telemetry.update_memory_pressure(snapshot.mw)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Memory collection failed | nodeId={}", self.node_id)
+            await asyncio.sleep(self.memory_interval_seconds)
+
     async def _refresh_engine_telemetry(self) -> None:
         engine_telemetry = await self.inference_engine.get_engine_telemetry()
         await self.telemetry.update_engine(engine_telemetry)
+
+    async def _engine_supervisor_loop(self) -> None:
+        """Keep the inference engine alive by restarting it on death with backoff."""
+        backoff = ENGINE_RESTART_INITIAL_BACKOFF_SECONDS
+        while True:
+            try:
+                await asyncio.sleep(self.engine_supervisor_interval_seconds)
+                health = await self.inference_engine.health()
+                if health.status:
+                    backoff = ENGINE_RESTART_INITIAL_BACKOFF_SECONDS
+                    continue
+                logger.warning(
+                    "Engine unhealthy — attempting restart | nodeId={} detail={}",
+                    self.node_id,
+                    health.detail,
+                )
+                try:
+                    await self.inference_engine.stop()
+                    await self.inference_engine.start()
+                    logger.info("Engine restarted | nodeId={}", self.node_id)
+                    backoff = ENGINE_RESTART_INITIAL_BACKOFF_SECONDS
+                except Exception:
+                    logger.exception(
+                        "Engine restart failed | nodeId={} retryInSeconds={}",
+                        self.node_id,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, ENGINE_RESTART_MAX_BACKOFF_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Engine supervisor loop error | nodeId={}", self.node_id)
+                await asyncio.sleep(self.engine_supervisor_interval_seconds)
 
     def _metadata_key(self) -> str:
         return f"{WORKER_METADATA_KEY_PREFIX}/{self.node_id}/metadata"
@@ -302,18 +374,12 @@ def _router_metadata() -> dict[str, Any]:
         try:
             quality = float(raw_quality)
         except ValueError:
-            logger.warning(
-                "Ignoring invalid RELAY_MODEL_QUALITY={!r}", raw_quality
-            )
+            logger.warning("Ignoring invalid RELAY_MODEL_QUALITY={!r}", raw_quality)
         else:
             out["model_quality"] = max(0.0, min(1.0, quality))
     raw_modalities = os.getenv("RELAY_MODALITIES")
     if raw_modalities:
-        modalities = [
-            part.strip().lower()
-            for part in raw_modalities.split(",")
-            if part.strip()
-        ]
+        modalities = [part.strip().lower() for part in raw_modalities.split(",") if part.strip()]
         if modalities:
             out["modalities"] = modalities
     return out

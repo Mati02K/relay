@@ -311,14 +311,14 @@ async def getSchedulerWeights() -> dict[str, float]:
 # Allowed ranges for each weight in POST /v1/scheduler/weights. The base
 # 5 stay in [0, 1] to match the paper-style cost terms; ``nu`` is the
 # RouteLLM quality knob and the ablation in SCHEDULER.md uses nu=5 and
-# nu=20, so the API has to accept that range.
+# nu=20 as its operating points.
 _WEIGHT_BOUNDS: dict[str, tuple[float, float]] = {
     "queue": (0.0, 1.0),
     "prefix_miss": (0.0, 1.0),
     "memory": (0.0, 1.0),
     "jitter": (0.0, 1.0),
     "thermal": (0.0, 1.0),
-    "nu": (0.0, 50.0),
+    "nu": (0.0, 20.0),
 }
 
 
@@ -328,9 +328,8 @@ async def setSchedulerWeights(payload: dict[str, float]) -> dict[str, float]:
 
     Accepts a partial JSON body — only the keys present are updated. The base
     5 weights must be floats in ``[0.0, 1.0]``; ``nu`` (RouteLLM quality knob)
-    is allowed up to ``50.0`` so dashboards can reach the operating points
-    used in SCHEDULER.md (``nu=5`` and ``nu=20``).
-    Returns the post-update snapshot.
+    is allowed up to ``20.0``, matching the operating points used in
+    SCHEDULER.md (``nu=5`` and ``nu=20``). Returns the post-update snapshot.
     """
     _requireActive()
     if not isinstance(payload, dict):

@@ -20,6 +20,9 @@ class EngineReportedTelemetry(BaseModel):
     """Telemetry read directly from the inference backend.
 
     For llama.cpp server this comes from endpoints such as ``/metrics``.
+    Memory pressure (``mw``) is no longer sourced from the engine — it is
+    collected at the OS/driver level by :mod:`telemetry.memory` so that all
+    VRAM consumers are visible, not just the engine's KV-cache pool.
     """
 
     model_config = {"frozen": True}
@@ -27,12 +30,6 @@ class EngineReportedTelemetry(BaseModel):
     qw: int = Field(
         0,
         description="Current engine queue/load; engine-provided when available, otherwise 0",
-    )
-    mw: float = Field(
-        0.0,
-        ge=0.0,
-        le=1.0,
-        description="Memory or KV-cache pressure, where 0.0 is empty/low and 1.0 is full/high",
     )
 
 
@@ -246,9 +243,15 @@ class Telemetry(BaseModel):
         engine: EngineReportedTelemetry | None = None,
         request: RequestComputedTelemetry | None = None,
         system: SystemTelemetry | None = None,
+        memory_mw: float = 0.0,
     ) -> Telemetry:
-        """Merge telemetry from backend, request, and system sources."""
-        engine = engine or EngineReportedTelemetry(qw=0, mw=0.0)
+        """Merge telemetry from backend, request, system, and memory sources.
+
+        ``memory_mw`` carries the system-level memory pressure collected by
+        :mod:`telemetry.memory` and is kept separate from ``system`` because
+        it is sampled on a different cadence by a dedicated background loop.
+        """
+        engine = engine or EngineReportedTelemetry(qw=0)
         request = request or RequestComputedTelemetry(
             prefix_cache=PrefixCacheTelemetry.from_config(PrefixHashConfig.from_env(), []),
             sprefill_tokens_per_sec=0.0,
@@ -256,7 +259,7 @@ class Telemetry(BaseModel):
         system = system or SystemTelemetry(jw=0.0, theta_w=0)
         return cls(
             qw=engine.qw,
-            mw=engine.mw,
+            mw=max(0.0, min(1.0, float(memory_mw))),
             jw=system.jw,
             theta_w=system.theta_w,
             thermal=system.thermal,

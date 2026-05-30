@@ -67,8 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--nu",
         type=float,
         help=(
-            "RouteLLM quality-routing weight in [0.0, 50.0]; "
-            "0 disables, 5-20 typical (coordinator only)"
+            "RouteLLM quality-routing weight in [0.0, 20.0]; "
+            "0 disables, 5 or 20 typical (coordinator only)"
         ),
     )
     init_parser.set_defaults(func=_cmd_init)

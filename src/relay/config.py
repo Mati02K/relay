@@ -61,8 +61,8 @@ class SchedulerConfig(BaseModel):
     Each weight scales one signal that contributes to a worker's cost; the
     scheduler picks the lowest-cost worker. The base 5 weights are bounded
     to ``[0.0, 1.0]``; ``nu`` (RouteLLM quality term) is bounded to
-    ``[0.0, 50.0]`` because the operating points in SCHEDULER.md use
-    ``nu=5`` and ``nu=20``.
+    ``[0.0, 20.0]``, matching the operating points in SCHEDULER.md
+    (``nu=5`` and ``nu=20``).
 
     The six weights map to the cost terms in ``src/coordinator/scheduler.py``:
 
@@ -80,7 +80,7 @@ class SchedulerConfig(BaseModel):
     memory: float = Field(default=1.0, ge=0.0, le=1.0)
     jitter: float = Field(default=1.0, ge=0.0, le=1.0)
     thermal: float = Field(default=1.0, ge=0.0, le=1.0)
-    nu: float = Field(default=0.0, ge=0.0, le=50.0)
+    nu: float = Field(default=0.0, ge=0.0, le=20.0)
 
 
 KNOWN_MODALITIES: tuple[str, ...] = ("text", "image", "audio", "video")

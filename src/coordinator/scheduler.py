@@ -26,6 +26,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from loguru import logger
+
 from coordinator.router import (
     detect_request_modalities,
     estimate_complexity_score,
@@ -226,17 +228,54 @@ def _score_worker(
     model_quality = worker_model_quality(_effective_metadata(worker))
     quality_term = quality_routing_term(weights.nu, complexity, model_quality)
 
+    cost = (
+        queue_term
+        + prefix_term
+        + memory_term
+        + jitter_term
+        + thermal_term
+        + quality_term
+        - worker_weight
+    )
+
+    logger.debug(
+        "scheduler cost | nodeId={} "
+        "| queue: w={} qw={} term={} "
+        "| prefix_miss: w={} miss={} term={} "
+        "| memory: w={} mw={} term={} "
+        "| jitter: w={} jw={} jmax={} term={} "
+        "| thermal: w={} theta_w={} term={} "
+        "| nu={} complexity={} model_quality={} quality_term={} "
+        "| worker_weight={} "
+        "| cost={}",
+        worker.node_id,
+        weights.queue,
+        telemetry.qw,
+        queue_term,
+        weights.prefix_miss,
+        1.0 - overlap,
+        prefix_term,
+        weights.memory,
+        telemetry.mw,
+        memory_term,
+        weights.jitter,
+        telemetry.jw,
+        jitter_max,
+        jitter_term,
+        weights.thermal,
+        telemetry.theta_w,
+        thermal_term,
+        weights.nu,
+        complexity,
+        model_quality,
+        quality_term,
+        worker_weight,
+        cost,
+    )
+
     return WorkerChoice(
         worker=worker,
-        cost=(
-            queue_term
-            + prefix_term
-            + memory_term
-            + jitter_term
-            + thermal_term
-            + quality_term
-            - worker_weight
-        ),
+        cost=cost,
         matched_blocks=matched_blocks,
         matched_tokens=matched_tokens,
         prompt_tokens=prompt_tokens,

@@ -566,9 +566,9 @@ const WEIGHT_FIELDS = [
   {
     key: "nu",
     label: "ν · quality",
-    max: 50,
-    step: 0.5,
-    hint: "RouteLLM: ν × complexity × (1 − quality). 0 disables. SCHEDULER.md uses 5–20.",
+    max: 20,
+    step: 0.25,
+    hint: "RouteLLM: ν × complexity × (1 − quality). 0 disables. SCHEDULER.md uses 5 and 20.",
   },
 ];
 
@@ -626,8 +626,8 @@ function renderWeights() {
       <span class="knob-key">${escapeHtml(field.label)}</span>
       <div class="knob-dial" data-bind="${field.key}-dial">
         <svg viewBox="0 0 60 60">
-          <circle class="knob-dial-track" cx="30" cy="30" r="24" stroke-dasharray="113 151" />
-          <circle class="knob-dial-fill"  cx="30" cy="30" r="24" stroke-dasharray="113 151" stroke-dashoffset="${dialOffset(value, field.max)}" />
+          <circle class="knob-dial-track" cx="30" cy="30" r="24" />
+          <circle class="knob-dial-fill"  cx="30" cy="30" r="24" stroke-dasharray="151" stroke-dashoffset="${dialOffset(value, field.max)}" />
         </svg>
         <span class="knob-dial-value" data-bind="${field.key}-num">${formatWeight(value, field.max)}</span>
       </div>
@@ -650,11 +650,11 @@ function renderWeights() {
   }
 }
 
-// SVG arc fill: the track has stroke-dasharray "113 151" (a ¾ arc, ~270°).
-// Drive `stroke-dashoffset` from full-empty (113) down to 0 to fill the arc.
+// SVG arc fill: circle r=24 has circumference 2π·24 ≈ 151. Drive
+// `stroke-dashoffset` from 151 (empty) down to 0 (full ring).
 function dialOffset(value, max) {
   const frac = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
-  return (113 * (1 - frac)).toFixed(2);
+  return (151 * (1 - frac)).toFixed(2);
 }
 
 function formatWeight(value, max) {

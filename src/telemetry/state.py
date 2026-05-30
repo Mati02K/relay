@@ -18,11 +18,12 @@ from telemetry.schemas import (
 
 
 class WorkerTelemetryState:
-    """Mutable worker telemetry assembled from engine, request, and system sources."""
+    """Mutable worker telemetry assembled from engine, request, system, and memory sources."""
 
     def __init__(self) -> None:
-        self._engine = EngineReportedTelemetry(qw=0, mw=0.0)
+        self._engine = EngineReportedTelemetry(qw=0)
         self._system = SystemTelemetry(jw=0.0, theta_w=0)
+        self._memory_mw: float = 0.0
         self._request_tracker = RequestTelemetryTracker()
         self._lock = asyncio.Lock()
 
@@ -39,6 +40,11 @@ class WorkerTelemetryState:
         """Replace worker-level system telemetry with the latest collector snapshot."""
         async with self._lock:
             self._system = telemetry
+
+    async def update_memory_pressure(self, mw: float) -> None:
+        """Replace the system-level memory pressure value."""
+        async with self._lock:
+            self._memory_mw = max(0.0, min(1.0, float(mw)))
 
     async def observe_request_completion(
         self,
@@ -59,12 +65,15 @@ class WorkerTelemetryState:
         """Return a coordinator-facing telemetry snapshot."""
         async with self._lock:
             request = self._request_tracker.snapshot()
-            return _combine(self._engine, request, self._system)
+            return _combine(self._engine, request, self._system, self._memory_mw)
 
 
 def _combine(
     engine: EngineReportedTelemetry,
     request: RequestComputedTelemetry,
     system: SystemTelemetry,
+    memory_mw: float,
 ) -> Telemetry:
-    return Telemetry.from_parts(engine=engine, request=request, system=system)
+    return Telemetry.from_parts(
+        engine=engine, request=request, system=system, memory_mw=memory_mw
+    )

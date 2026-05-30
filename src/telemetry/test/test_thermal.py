@@ -10,9 +10,15 @@ from telemetry.thermal.apple import (
     thermal_state_to_theta_w,
 )
 from telemetry.thermal.base import (
+    CPU_HEADROOM_CRITICAL_C,
+    CPU_HEADROOM_WARN_C,
+    CPU_WEIGHT_CRITICAL,
+    CPU_WEIGHT_DEFAULT,
+    CPU_WEIGHT_WARN,
     NullThermalCollector,
     ThermalAggregator,
     ThermalSourceSample,
+    aggregate_thermal_samples,
     pressure_from_temperature,
     pressure_from_throttle_rate,
 )
@@ -138,6 +144,146 @@ def test_aggregator_uses_gpu_pressure_for_gpu_primary() -> None:
     snapshot = asyncio.run(aggregator.sample())
 
     assert snapshot.pressure == pytest.approx(0.7)
+
+
+def _cpu_sample(
+    pressure: float,
+    temperature_c: float | None = None,
+    limit_c: float | None = None,
+) -> ThermalSourceSample:
+    return ThermalSourceSample(
+        source="test-cpu",
+        device_type="cpu",
+        pressure=pressure,
+        state="normal",
+        temperature_c=temperature_c,
+        limit_c=limit_c,
+    )
+
+
+def _gpu_sample(pressure: float) -> ThermalSourceSample:
+    return ThermalSourceSample(
+        source="test-gpu",
+        device_type="gpu",
+        pressure=pressure,
+        state="normal",
+    )
+
+
+# ── Headroom-based dynamic CPU weighting (GPU-primary) ─────────────────────
+
+
+def test_headroom_no_temp_data_falls_back_to_default_weight() -> None:
+    # No temperature_c / limit_c → weight stays at CPU_WEIGHT_DEFAULT.
+    snapshot = aggregate_thermal_samples(
+        [_cpu_sample(0.9), _gpu_sample(0.0)],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_DEFAULT)
+    assert snapshot.pressure == pytest.approx(0.9 * CPU_WEIGHT_DEFAULT)
+
+
+def test_headroom_safe_zone_uses_default_weight() -> None:
+    # CPU 75 °C, limit 100 °C → headroom 25 °C ≥ CPU_HEADROOM_WARN_C (15).
+    snapshot = aggregate_thermal_samples(
+        [_cpu_sample(0.9, temperature_c=75.0, limit_c=100.0), _gpu_sample(0.0)],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_DEFAULT)
+    assert snapshot.pressure == pytest.approx(0.9 * CPU_WEIGHT_DEFAULT)
+
+
+def test_headroom_warn_zone_raises_cpu_weight() -> None:
+    # CPU 90 °C, limit 100 °C → headroom 10 °C, inside warn band [5, 15).
+    snapshot = aggregate_thermal_samples(
+        [_cpu_sample(0.9, temperature_c=90.0, limit_c=100.0), _gpu_sample(0.0)],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_WARN)
+    assert snapshot.pressure == pytest.approx(0.9 * CPU_WEIGHT_WARN)
+
+
+def test_headroom_critical_zone_treats_cpu_as_primary() -> None:
+    # CPU 96 °C, limit 100 °C → headroom 4 °C < CPU_HEADROOM_CRITICAL_C (5).
+    snapshot = aggregate_thermal_samples(
+        [_cpu_sample(0.9, temperature_c=96.0, limit_c=100.0), _gpu_sample(0.0)],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_CRITICAL)
+    assert snapshot.pressure == pytest.approx(0.9)
+
+
+def test_headroom_cool_gpu_still_wins_over_marginal_cpu() -> None:
+    # GPU pressure is higher than weighted CPU → GPU still sets the floor.
+    snapshot = aggregate_thermal_samples(
+        [_cpu_sample(0.5, temperature_c=90.0, limit_c=100.0), _gpu_sample(0.8)],
+        primary_device="gpu",
+    )
+
+    assert snapshot.pressure == pytest.approx(0.8)
+
+
+def test_headroom_boundary_exactly_at_warn_threshold() -> None:
+    # Headroom == CPU_HEADROOM_WARN_C exactly → still default weight.
+    snapshot = aggregate_thermal_samples(
+        [
+            _cpu_sample(
+                0.9,
+                temperature_c=100.0 - CPU_HEADROOM_WARN_C,
+                limit_c=100.0,
+            ),
+            _gpu_sample(0.0),
+        ],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_DEFAULT)
+
+
+def test_headroom_boundary_just_inside_warn_threshold() -> None:
+    # Headroom == CPU_HEADROOM_WARN_C - 0.1 → warn weight.
+    snapshot = aggregate_thermal_samples(
+        [
+            _cpu_sample(
+                0.9,
+                temperature_c=100.0 - CPU_HEADROOM_WARN_C + 0.1,
+                limit_c=100.0,
+            ),
+            _gpu_sample(0.0),
+        ],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_WARN)
+
+
+def test_headroom_worst_cpu_sample_drives_weight_with_multiple_sources() -> None:
+    # Two CPU samples: one safe, one critical → worst headroom wins.
+    snapshot = aggregate_thermal_samples(
+        [
+            _cpu_sample(0.5, temperature_c=75.0, limit_c=100.0),   # safe, 25°C headroom
+            _cpu_sample(0.9, temperature_c=96.0, limit_c=100.0),   # critical, 4°C headroom
+            _gpu_sample(0.0),
+        ],
+        primary_device="gpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(CPU_WEIGHT_CRITICAL)
+
+
+def test_headroom_does_not_affect_cpu_primary_aggregation() -> None:
+    # When primary_device == "cpu" the CPU weight should always be 1.0.
+    snapshot = aggregate_thermal_samples(
+        [_cpu_sample(0.9, temperature_c=96.0, limit_c=100.0), _gpu_sample(0.0)],
+        primary_device="cpu",
+    )
+
+    assert snapshot.cpu_weight == pytest.approx(1.0)
+    assert snapshot.pressure == pytest.approx(0.9)
 
 
 def test_aggregator_treats_raising_collector_as_zero() -> None:
@@ -279,20 +425,20 @@ def test_cpu_throttle_rate_mapping(rate: float, expected: float) -> None:
 
 
 def test_pressure_from_temperature_normal_temps_return_zero() -> None:
-    # Default 8C warm margin. A chip cruising well below the limit must
-    # report no pressure — being warm is not the same as being throttled.
+    # Default 10 °C warm margin: the window starts at (limit - 10) = 90 °C.
+    # A chip cruising well below that must report no pressure.
     assert pressure_from_temperature(70.0, 100.0) == 0.0
     assert pressure_from_temperature(88.0, 100.0) == 0.0
-    assert pressure_from_temperature(91.99, 100.0) == 0.0
+    assert pressure_from_temperature(89.99, 100.0) == 0.0
 
 
 def test_pressure_from_temperature_quadratic_inside_margin() -> None:
     # At the limit, pressure saturates at 1.0.
     assert pressure_from_temperature(100.0, 100.0) == pytest.approx(1.0, abs=1e-6)
-    # Mid-margin (4C inside an 8C window) → ratio 0.5 → quadratic 0.25.
-    assert pressure_from_temperature(96.0, 100.0) == pytest.approx(0.25, abs=1e-6)
-    # 2C below limit → ratio 0.75 → quadratic ~0.5625.
-    assert pressure_from_temperature(98.0, 100.0) == pytest.approx(0.5625, abs=1e-6)
+    # Mid-margin: 5 °C inside a 10 °C window → ratio 0.5 → quadratic 0.25.
+    assert pressure_from_temperature(95.0, 100.0) == pytest.approx(0.25, abs=1e-6)
+    # 2 °C below limit → ratio 0.8 → quadratic 0.64.
+    assert pressure_from_temperature(98.0, 100.0) == pytest.approx(0.64, abs=1e-6)
 
 
 def test_pressure_from_temperature_unknown_inputs_return_zero() -> None:

@@ -19,6 +19,18 @@ THERMAL_STATE_THROTTLING = "throttling"
 THERMAL_STATE_CRITICAL = "critical"
 THERMAL_STATE_UNKNOWN = "unknown"
 
+# Thermal headroom thresholds used to dynamically weight CPU pressure when the
+# model runs on GPU.  "Headroom" = (limit_c - temperature_c).  As the CPU
+# closes in on its thermal trip point it increasingly bottlenecks PCIe
+# dispatch, tokenisation, and llama-server process scheduling even though the
+# GPU is the primary compute device.
+CPU_HEADROOM_CRITICAL_C: float = 5.0   # < 5 °C left → treat CPU as primary
+CPU_HEADROOM_WARN_C: float = 15.0      # < 15 °C left → raise coefficient
+CPU_WEIGHT_DEFAULT: float = 0.35       # safe headroom, GPU clearly dominant
+CPU_WEIGHT_WARN: float = 0.60          # closing in on limit
+CPU_WEIGHT_CRITICAL: float = 1.0       # about to throttle, CPU is a bottleneck
+GPU_WEIGHT_CPU_PRIMARY: float = 0.50   # GPU contribution when CPU is primary
+
 
 @dataclass(frozen=True)
 class ThermalSourceSample:
@@ -56,6 +68,7 @@ class ThermalSnapshot:
     cpu_pressure: float
     gpu_pressure: float
     sources: list[ThermalSourceSample]
+    cpu_weight: float = CPU_WEIGHT_DEFAULT
 
     @property
     def theta_w(self) -> float:
@@ -147,11 +160,12 @@ class ThermalAggregator:
         snapshot = aggregate_thermal_samples(samples, primary_device=self._primary_device)
         logger.debug(
             "Thermal aggregate sample | pressure={:.3f} state={} cpu={:.3f} "
-            "gpu={:.3f} collectors={}",
+            "gpu={:.3f} cpuWeight={:.2f} collectors={}",
             snapshot.pressure,
             snapshot.state,
             snapshot.cpu_pressure,
             snapshot.gpu_pressure,
+            snapshot.cpu_weight,
             self.collector_names,
         )
         return snapshot
@@ -163,6 +177,42 @@ class ThermalAggregator:
                 await collector.close()
             except Exception:
                 logger.exception("Thermal collector close failed | name={}", collector.name)
+
+
+def _cpu_headroom_weight(cpu_samples: list[ThermalSourceSample]) -> float:
+    """Return the CPU pressure coefficient for GPU-primary aggregation.
+
+    When the model runs on GPU the CPU is not the bottleneck under normal
+    conditions, so its thermal pressure is down-weighted.  However, a CPU
+    that is about to throttle still degrades PCIe dispatch, tokenisation, and
+    the llama-server process itself, so the coefficient escalates as the CPU
+    closes in on its thermal trip point.
+
+    The headroom tiers map to:
+    * ``>= CPU_HEADROOM_WARN_C``     → ``CPU_WEIGHT_DEFAULT`` (0.35)
+    * ``[CPU_HEADROOM_CRITICAL_C, CPU_HEADROOM_WARN_C)`` → ``CPU_WEIGHT_WARN`` (0.60)
+    * ``< CPU_HEADROOM_CRITICAL_C``  → ``CPU_WEIGHT_CRITICAL`` (1.0)
+
+    If no sample supplies temperature *and* limit data the default weight is
+    used so the fallback is conservative rather than silently inflating cost.
+    """
+    min_headroom: float | None = None
+    for sample in cpu_samples:
+        if (
+            sample.temperature_c is not None
+            and sample.limit_c is not None
+            and sample.limit_c > 0
+        ):
+            headroom = sample.limit_c - sample.temperature_c
+            if min_headroom is None or headroom < min_headroom:
+                min_headroom = headroom
+    if min_headroom is None:
+        return CPU_WEIGHT_DEFAULT
+    if min_headroom < CPU_HEADROOM_CRITICAL_C:
+        return CPU_WEIGHT_CRITICAL
+    if min_headroom < CPU_HEADROOM_WARN_C:
+        return CPU_WEIGHT_WARN
+    return CPU_WEIGHT_DEFAULT
 
 
 def aggregate_thermal_samples(
@@ -192,10 +242,14 @@ def aggregate_thermal_samples(
     has_gpu = any(sample.device_type == "gpu" for sample in normalized)
     has_cpu = any(sample.device_type == "cpu" for sample in normalized)
     if primary_device == "gpu" and has_gpu:
-        pressure = max(gpu_pressure, cpu_pressure * 0.35)
+        cpu_samples = [s for s in normalized if s.device_type == "cpu"]
+        cpu_weight = _cpu_headroom_weight(cpu_samples)
+        pressure = max(gpu_pressure, cpu_pressure * cpu_weight)
     elif primary_device == "cpu" and has_cpu:
-        pressure = max(cpu_pressure, gpu_pressure * 0.50)
+        cpu_weight = 1.0
+        pressure = max(cpu_pressure, gpu_pressure * GPU_WEIGHT_CPU_PRIMARY)
     else:
+        cpu_weight = 1.0
         pressure = max((sample.pressure for sample in normalized), default=0.0)
     return ThermalSnapshot(
         pressure=pressure,
@@ -203,6 +257,7 @@ def aggregate_thermal_samples(
         cpu_pressure=cpu_pressure,
         gpu_pressure=gpu_pressure,
         sources=normalized,
+        cpu_weight=cpu_weight,
     )
 
 
