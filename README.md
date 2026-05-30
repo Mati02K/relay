@@ -242,21 +242,103 @@ relay models list
 
 ### Using LAN (recommended for same-network setups)
 
-If every machine sits on the same local network, this is the default and
-simplest backend — no overlay, no extra daemons. Pass each node its LAN IP
-explicitly:
+All machines on the same local network — no overlay, no extra daemons.
+Relay auto-detects your LAN IP so you do not need to pass `--host`.
+
+#### Step 1 — Open firewall ports
+
+On the **coordinator machine**:
 
 ```bash
-# Coordinator
-relay init --role dual --network lan --host 192.168.1.10 --node-id home-server
-
-# Worker
-relay init --role worker --network lan --host 192.168.1.11 \
-    --coordinator http://192.168.1.10:8080 --node-id laptop-worker
+sudo ufw allow 8080/tcp    # coordinator API
+sudo ufw allow 50051/tcp   # membership-etcd gRPC (workers register here)
 ```
 
-You must pass `--host` on each node since LAN auto-discovery (mDNS) is not
-wired into the scheduling path. Workers register through etcd in the usual way.
+On each **worker machine**:
+
+```bash
+sudo ufw allow 9090/tcp    # worker API (coordinator proxies requests here)
+```
+
+#### Step 2 — Start the coordinator
+
+```bash
+relay init --role dual --network lan --node-id home-server --model qwen2.5-3b
+relay start
+relay status
+```
+
+`relay status` will show the detected LAN IP in the coordinator address.
+Note it — you need it for the worker step.
+
+Confirm the coordinator is reachable from any machine on the network:
+
+```bash
+curl http://COORD_IP:8080/health
+# {"status":"ok","nodeId":"home-server","isLeader":true}
+```
+
+#### Step 3 — Join each worker
+
+On every worker machine:
+
+```bash
+relay init --role worker \
+    --network lan \
+    --coordinator http://COORD_IP:8080 \
+    --node-id my-worker \
+    --model qwen2.5-0.5b
+
+relay start
+relay status
+```
+
+Each worker auto-detects its own LAN IP and registers it with the coordinator.
+You can use a different model on each worker — the coordinator routes by the
+`model` field in the request.
+
+#### Step 4 — Verify the cluster
+
+From any machine:
+
+```bash
+curl http://COORD_IP:8080/v1/workers | python3 -m json.tool
+```
+
+Every registered worker appears with `"healthy": true`. Then send a request:
+
+```bash
+curl -sN http://COORD_IP:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen2.5-3b",
+    "messages": [{"role": "user", "content": "Say hello."}],
+    "max_tokens": 32
+  }'
+```
+
+Check `X-Relay-Worker` in the response headers to see which worker handled it:
+
+```bash
+curl -sI -XPOST http://COORD_IP:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen2.5-3b","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
+  | grep X-Relay
+```
+
+#### Troubleshooting
+
+**Worker registers but requests never reach it:**
+The coordinator cannot connect to the worker's port. Check `sudo ufw status`
+on the worker machine — port `9090` must be open.
+
+**Worker fails to start with a gRPC error:**
+The worker cannot reach `COORD_IP:50051`. Check the coordinator machine's
+firewall — port `50051` must be open.
+
+**Wrong IP advertised (worker registers as `127.0.0.1`):**
+This can happen on machines with no default route (offline or VPN-only).
+Pass `--host YOUR_LAN_IP` explicitly to `relay init` to override auto-detection.
 
 ---
 

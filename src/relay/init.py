@@ -427,7 +427,8 @@ def _resolve_catalog_model_selection(value: str) -> str:
 
 def _default_host(network: NetworkBackend) -> str:
     if network == "lan":
-        return "127.0.0.1"
+        from network.lan import LANNetwork
+        return LANNetwork().getMyAddress()
     tailscale = shutil.which("tailscale")
     if not tailscale:
         return "127.0.0.1"
