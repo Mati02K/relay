@@ -12,7 +12,9 @@ from relay.config import (
     ConfigError,
     CoordinatorConfig,
     EngineConfig,
+    EngineName,
     MembershipConfig,
+    ModelConfig,
     NetworkBackend,
     NetworkConfig,
     NodeRole,
@@ -23,7 +25,14 @@ from relay.config import (
     normalize_coordinator_url,
     save_config,
 )
-from relay.models import MODEL_CATALOG, pull_catalog_model, register_local_model
+from relay.models import (
+    MLX_MODEL_CATALOG,
+    MODEL_CATALOG,
+    find_mlx_catalog_model,
+    pull_catalog_model,
+    pull_mlx_model,
+    register_local_model,
+)
 from relay.paths import RelayPaths
 from relay.software import ensure_runtime_software
 from relay.supervisor import stop as stop_managed_processes
@@ -44,6 +53,7 @@ class InitOptions:
     skip_model: bool
     worker_weight: float | None = None
     nu: float | None = None
+    engine: str | None = None
 
 
 def run_init(options: InitOptions) -> RelayConfig:
@@ -73,6 +83,7 @@ def run_init(options: InitOptions) -> RelayConfig:
 
     prompted_node_id = options.node_id or _prompt_text("Node id", default=None, required=False)
     worker_weight = _select_worker_weight(role, options.worker_weight)
+    engine_name = _select_engine(role, options.engine)
     config_kwargs: dict[str, object] = {
         "role": role,
         "network": NetworkConfig(backend=network),
@@ -83,14 +94,17 @@ def run_init(options: InitOptions) -> RelayConfig:
             coordinator_url=coordinator_url,
             weight=worker_weight,
         ),
-        "engine": EngineConfig(),
+        "engine": EngineConfig(name=engine_name),
     }
     if prompted_node_id:
         config_kwargs["node_id"] = prompted_node_id
     config = RelayConfig.model_validate(config_kwargs)
 
     if config.runs_worker and not options.skip_model:
-        config = _configure_model(config, options)
+        if engine_name == "mlx":
+            config = _configure_model_mlx(config, options)
+        else:
+            config = _configure_model(config, options)
 
     if config.runs_coordinator:
         config = _configure_scheduler(config, options)
@@ -144,6 +158,137 @@ def _select_network(value: str | None) -> NetworkBackend:
             suffix={"tailscale": "for cross-network/multi-site deployments"},
         ),
     )
+
+
+def _select_engine(role: NodeRole, flag_value: str | None) -> EngineName:
+    """Resolve inference engine from flag or interactive prompt.
+
+    Coordinator-only nodes don't run inference; return the default without
+    prompting. For worker/dual roles ask the user to choose.
+    """
+    if role == "coordinator":
+        return "llama.cpp"
+    if flag_value:
+        return _validate_choice(flag_value, ("llama.cpp", "mlx"), "engine")  # type: ignore[return-value]
+    return _prompt_choice(  # type: ignore[return-value]
+        "Inference engine",
+        ("llama.cpp", "mlx"),
+        default="llama.cpp",
+        suffix={
+            "llama.cpp": "local GGUF model via llama-server",
+            "mlx": "HuggingFace model via mlx_lm.server (Apple Silicon)",
+        },
+    )
+
+
+def _configure_model_mlx(config: RelayConfig, options: InitOptions) -> RelayConfig:
+    """Configure an MLX model, reusing already-downloaded models when available.
+
+    Mirrors the llamacpp flow: if models exist in ~/.relay/models/ the user is
+    offered a local-pick menu first. They can also pull a new model from
+    HuggingFace or skip and configure later.
+    """
+    if options.model_path:
+        model_id = options.model or Path(options.model_path).name
+        model = ModelConfig(
+            id=model_id,
+            engine="mlx",
+            path=options.model_path,
+            source="local",
+            loaded=True,
+        )
+        return config.with_model(model)
+
+    if options.model:
+        repo_id = _resolve_mlx_model_selection(options.model)
+        updated, _ = pull_mlx_model(config, repo_id)
+        return updated
+
+    action = _prompt_choice(
+        "MLX model setup",
+        ("local", "pull", "skip"),
+        default="skip",
+        suffix={
+            "local": "use an already-downloaded MLX model from ~/.relay/models/",
+            "pull": "download a new model from HuggingFace",
+            "skip": "configure later with relay init",
+        },
+    )
+    if action == "skip":
+        return config
+    if action == "local":
+        return _select_local_mlx_model(config)
+
+    print("Available MLX models:")
+    for index, m in enumerate(MLX_MODEL_CATALOG, start=1):
+        print(f"  {index}. {m.id} — {m.label}")
+    raw = _prompt_text(
+        "Model id, number, or HuggingFace repo (e.g. mlx-community/...)",
+        default=None,
+        required=False,
+    )
+    if not raw:
+        return config
+    repo_id = _resolve_mlx_model_selection(raw)
+    updated, _ = pull_mlx_model(config, repo_id)
+    return updated
+
+
+def _select_local_mlx_model(config: RelayConfig) -> RelayConfig:
+    """Pick an already-downloaded MLX model from ~/.relay/models/."""
+    paths = RelayPaths.from_home()
+    found = _discover_local_mlx_models(paths.models)
+    if not found:
+        print(
+            "No MLX models found in",
+            paths.models,
+            "— use 'pull' to download one first.",
+        )
+        return config
+    print("Local MLX models found:")
+    for index, (label, path) in enumerate(found, start=1):
+        print(f"  {index}. {label}")
+    raw = _prompt_text("Pick a model number", default="1", required=False)
+    chosen_path = _resolve_local_pick(raw, found)
+    model = ModelConfig(
+        id=chosen_path.name,
+        engine="mlx",
+        path=str(chosen_path),
+        source="local",
+        loaded=True,
+    )
+    return config.with_model(model)
+
+
+def _discover_local_mlx_models(models_root: Path) -> list[tuple[str, Path]]:
+    """Return (label, path) pairs for every MLX model dir under the Relay models dir.
+
+    A directory is considered an MLX model if it contains config.json plus at
+    least one .safetensors or .npz weight file.
+    """
+    if not models_root.is_dir():
+        return []
+    discovered: list[tuple[str, Path]] = []
+    for d in sorted(models_root.iterdir()):
+        if not d.is_dir():
+            continue
+        if not (d / "config.json").exists():
+            continue
+        has_weights = any(d.glob("*.safetensors")) or any(d.glob("*.npz"))
+        if not has_weights:
+            continue
+        size_mb = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / (1024**2)
+        label = f"{d.name} ({size_mb:.0f} MB)"
+        discovered.append((label, d))
+    return discovered
+
+
+def _resolve_mlx_model_selection(value: str) -> str:
+    """Return a HuggingFace repo ID from a catalog id, number, or raw repo ID."""
+    entry = find_mlx_catalog_model(value)
+    if entry:
+        return entry.repo_id
+    return value.strip()
 
 
 def _configure_model(config: RelayConfig, options: InitOptions) -> RelayConfig:

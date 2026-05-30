@@ -10,7 +10,7 @@
 // every WORKER_POLL_INTERVAL_MS; the chat view does its own bookkeeping;
 // the settings view only fetches when first opened.
 
-const WORKER_POLL_INTERVAL_MS = 3000;
+const WORKER_POLL_INTERVAL_MS = 1000;
 const PREFILL_HISTORY_LENGTH = 60;
 
 const state = {

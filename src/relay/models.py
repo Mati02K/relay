@@ -87,6 +87,34 @@ MODEL_CATALOG: tuple[CatalogModel, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class MlxCatalogModel:
+    """A downloadable MLX model option exposed by the CLI."""
+
+    id: str
+    label: str
+    repo_id: str
+
+
+MLX_MODEL_CATALOG: tuple[MlxCatalogModel, ...] = (
+    MlxCatalogModel(
+        id="qwen2.5-0.5b-mlx",
+        label="Qwen2.5 0.5B Instruct (MLX 4-bit) ~300 MB",
+        repo_id="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    ),
+    MlxCatalogModel(
+        id="qwen2.5-1.5b-mlx",
+        label="Qwen2.5 1.5B Instruct (MLX 4-bit) ~900 MB",
+        repo_id="mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+    ),
+    MlxCatalogModel(
+        id="llama-3.2-1b-mlx",
+        label="Llama 3.2 1B Instruct (MLX 4-bit) ~600 MB",
+        repo_id="mlx-community/Llama-3.2-1B-Instruct-4bit",
+    ),
+)
+
+
 class ModelCatalogError(RuntimeError):
     """Raised when a requested model cannot be resolved."""
 
@@ -131,6 +159,7 @@ def pull_catalog_model(config: RelayConfig, model_id: str) -> tuple[RelayConfig,
 
     paths = RelayPaths.from_home()
     paths.ensure()
+    print(f"Downloading {filename} from {catalog_model.repo_id}...")
     try:
         local_path = hf["hf_hub_download"](
             repo_id=catalog_model.repo_id,
@@ -138,6 +167,13 @@ def pull_catalog_model(config: RelayConfig, model_id: str) -> tuple[RelayConfig,
             local_dir=str(paths.models / catalog_model.id),
         )
     except Exception as e:
+        err = str(e)
+        if "401" in err or "credentials" in err.lower() or "token" in err.lower():
+            raise ModelCatalogError(
+                f"HuggingFace authentication required to download {catalog_model.repo_id}.\n"
+                "Log in with:  huggingface-cli login\n"
+                "Then re-run relay init or relay pull."
+            ) from e
         raise ModelCatalogError(
             f"Failed to download {filename} from {catalog_model.repo_id}: {e}"
         ) from e
@@ -155,6 +191,65 @@ def pull_catalog_model(config: RelayConfig, model_id: str) -> tuple[RelayConfig,
     return config.with_model(model), model
 
 
+def pull_mlx_model(config: RelayConfig, repo_id: str) -> tuple[RelayConfig, ModelConfig]:
+    """Download an MLX model repo from HuggingFace into ~/.relay/models/.
+
+    Uses ``snapshot_download`` with ``local_dir`` so files land in the same
+    place as GGUF models rather than the HuggingFace cache directory.
+    """
+    hf = _load_huggingface_hub()
+    model_id = repo_id.split("/")[-1]
+    paths = RelayPaths.from_home()
+    paths.ensure()
+    local_dir = paths.models / model_id
+    print(f"Downloading {repo_id} to {local_dir} (this may take a few minutes)...")
+    try:
+        local_path = hf["snapshot_download"](repo_id=repo_id, local_dir=str(local_dir))
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "credentials" in err.lower() or "token" in err.lower():
+            raise ModelCatalogError(
+                f"HuggingFace authentication required to download {repo_id}.\n"
+                "Log in with:  huggingface-cli login\n"
+                "Then re-run relay init."
+            ) from e
+        if "404" in err or "Repository Not Found" in err:
+            raise ModelCatalogError(
+                f"Model not found: {repo_id}\n"
+                "Check the repo ID at https://huggingface.co/mlx-community"
+            ) from e
+        raise ModelCatalogError(f"Failed to download {repo_id}: {e}") from e
+    model = ModelConfig(
+        id=model_id,
+        engine="mlx",
+        path=str(local_path),
+        source="huggingface",
+        repo_id=repo_id,
+        loaded=True,
+    )
+    print(f"Downloaded {model_id}: {local_path}")
+    return config.with_model(model), model
+
+
+def mlx_catalog_rows() -> list[str]:
+    """Return display rows for the MLX model catalog."""
+    return [f"{m.id:22} {m.label} ({m.repo_id})" for m in MLX_MODEL_CATALOG]
+
+
+def find_mlx_catalog_model(value: str) -> MlxCatalogModel | None:
+    """Resolve a catalog id or 1-based number to an MLX catalog entry."""
+    stripped = value.strip()
+    if stripped.isdigit():
+        idx = int(stripped)
+        if 1 <= idx <= len(MLX_MODEL_CATALOG):
+            return MLX_MODEL_CATALOG[idx - 1]
+        return None
+    for m in MLX_MODEL_CATALOG:
+        if m.id == stripped.lower():
+            return m
+    return None
+
+
 def _load_huggingface_hub() -> dict[str, Any]:
     try:
         module = import_module("huggingface_hub")
@@ -166,6 +261,7 @@ def _load_huggingface_hub() -> dict[str, Any]:
     return {
         "hf_hub_download": getattr(module, "hf_hub_download"),
         "list_repo_files": getattr(module, "list_repo_files"),
+        "snapshot_download": getattr(module, "snapshot_download"),
     }
 
 

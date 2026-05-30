@@ -62,6 +62,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "0 disables the chart, 2-3 typical (coordinator only)"
         ),
     )
+    init_parser.add_argument(
+        "--engine",
+        choices=("llama.cpp", "mlx"),
+        help="inference engine: llama.cpp (default) or mlx (Apple Silicon via mlx_lm)",
+    )
     init_parser.set_defaults(func=_cmd_init)
 
     start_parser = sub.add_parser("start", help="start configured Relay processes")
@@ -145,6 +150,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
             skip_model=bool(args.skip_model),
             worker_weight=args.worker_weight,
             nu=args.nu,
+            engine=args.engine,
         )
     )
     print(f"{ok('config:')} {RelayPaths.from_home().config}")

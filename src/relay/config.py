@@ -16,7 +16,7 @@ from relay.paths import RelayPaths
 NodeRole = Literal["coordinator", "worker", "dual"]
 NetworkBackend = Literal["lan", "tailscale"]
 MembershipBackend = Literal["etcd"]
-EngineName = Literal["llama.cpp"]
+EngineName = Literal["llama.cpp", "mlx"]
 
 
 class ConfigError(RuntimeError):

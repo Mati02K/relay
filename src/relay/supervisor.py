@@ -214,11 +214,13 @@ def build_process_specs(config: RelayConfig | None, paths: RelayPaths) -> list[M
         worker_env["RELAY_MODEL_ID"] = model.id
         worker_env["LLAMA_MODEL_ID"] = model.id
         worker_env["LLAMA_MODEL_PATH"] = model.path
-        worker_env["LLAMA_SERVER_BIN"] = _llama_server_binary(config.engine.server_bin)
+        if config.engine.name == "llama.cpp":
+            worker_env["LLAMA_SERVER_BIN"] = _llama_server_binary(config.engine.server_bin)
         worker_env["LLAMA_SERVER_HOST"] = config.engine.server_host
         worker_env["LLAMA_SERVER_PORT"] = str(config.engine.server_port)
         worker_env["LLAMA_SERVER_EXTRA_ARGS"] = config.engine.extra_args
         worker_env["RELAY_MODEL_INVENTORY_JSON"] = model_inventory_json(config)
+        worker_env["RELAY_ENGINE"] = config.engine.name
         specs.append(
             ManagedProcess(
                 name="worker",
