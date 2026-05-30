@@ -117,6 +117,33 @@ _DEFAULT_CHART: dict[str, dict[str, Any]] = {
         "quant": "q4_k_m",
         "quality": 0.56,
     },
+    # MLX variants — same quality numbers as their non-MLX twins so a
+    # request routed to a Mac running MLX is scored fairly against a
+    # llama.cpp box running the equivalent GGUF.
+    "qwen2.5-7b-mlx": {
+        "skills": ["instruct", "chat", "reasoning"],
+        "params_b": 7.6,
+        "quant": "4bit",
+        "quality": 0.80,
+    },
+    "qwen2.5-1.5b-mlx": {
+        "skills": ["instruct", "chat"],
+        "params_b": 1.5,
+        "quant": "4bit",
+        "quality": 0.45,
+    },
+    "qwen2.5-0.5b-mlx": {
+        "skills": ["instruct", "chat"],
+        "params_b": 0.5,
+        "quant": "4bit",
+        "quality": 0.28,
+    },
+    "llama-3.2-1b-mlx": {
+        "skills": ["instruct", "chat"],
+        "params_b": 1.2,
+        "quant": "4bit",
+        "quality": 0.38,
+    },
 }
 
 

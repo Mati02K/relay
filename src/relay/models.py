@@ -112,6 +112,11 @@ MLX_MODEL_CATALOG: tuple[MlxCatalogModel, ...] = (
         label="Llama 3.2 1B Instruct (MLX 4-bit) ~600 MB",
         repo_id="mlx-community/Llama-3.2-1B-Instruct-4bit",
     ),
+    MlxCatalogModel(
+        id="qwen2.5-7b-mlx",
+        label="Qwen2.5 7B Instruct (MLX 4-bit) ~4.5 GB",
+        repo_id="mlx-community/Qwen2.5-7B-Instruct-4bit",
+    ),
 )
 
 

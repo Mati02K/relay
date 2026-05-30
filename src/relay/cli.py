@@ -10,7 +10,14 @@ from pathlib import Path
 
 from relay.config import ConfigError, load_config, save_config
 from relay.init import InitOptions, run_init
-from relay.models import catalog_rows, pull_catalog_model, register_local_model
+from relay.models import (
+    catalog_rows,
+    find_mlx_catalog_model,
+    mlx_catalog_rows,
+    pull_catalog_model,
+    pull_mlx_model,
+    register_local_model,
+)
 from relay.paths import RelayPaths
 from relay.software import doctor_checks
 from relay.supervisor import (
@@ -257,11 +264,18 @@ def _cmd_pull(args: argparse.Namespace) -> int:
         print(f"Registered local model {model_id}: {args.local}")
         return 0
     if not args.model:
-        print("Available models:")
+        print("Available llama.cpp models:")
         for row in catalog_rows():
             print("  " + row)
+        print("\nAvailable MLX models (Apple Silicon):")
+        for row in mlx_catalog_rows():
+            print("  " + row)
         return 0
-    config, model = pull_catalog_model(config, str(args.model))
+    mlx_entry = find_mlx_catalog_model(str(args.model))
+    if mlx_entry is not None:
+        config, model = pull_mlx_model(config, mlx_entry.repo_id)
+    else:
+        config, model = pull_catalog_model(config, str(args.model))
     save_config(config)
     print(f"Downloaded {model.id}: {model.path}")
     return 0
@@ -293,7 +307,11 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
 def _cmd_models_list(args: argparse.Namespace) -> int:
     if args.catalog:
+        print("# llama.cpp")
         for row in catalog_rows():
+            print(row)
+        print("\n# mlx (Apple Silicon)")
+        for row in mlx_catalog_rows():
             print(row)
         return 0
     config = load_config()
