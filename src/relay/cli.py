@@ -54,6 +54,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         help="per-worker scheduler preference in [-1.0, 1.0]; default 0.0 (no effect)",
     )
+    init_parser.add_argument(
+        "--engine",
+        choices=("llama.cpp", "mlx"),
+        help="inference engine: llama.cpp (default) or mlx (Apple Silicon via mlx_lm)",
+    )
     init_parser.set_defaults(func=_cmd_init)
 
     start_parser = sub.add_parser("start", help="start configured Relay processes")
@@ -136,6 +141,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
             model_path=args.model_path,
             skip_model=bool(args.skip_model),
             worker_weight=args.worker_weight,
+            engine=args.engine,
         )
     )
     print(f"{ok('config:')} {RelayPaths.from_home().config}")

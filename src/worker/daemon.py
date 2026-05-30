@@ -21,6 +21,7 @@ from telemetry.state import WorkerTelemetryState
 from telemetry.thermal import ThermalAggregator, detect_thermal_collectors
 from worker.inference.base import InferenceEngine
 from worker.inference.llamacpp import LlamaCppEngine
+from worker.inference.mlx import MlxEngine
 
 WORKER_METADATA_KEY_PREFIX = "/relay/workers"
 TELEMETRY_INTERVAL_SECONDS = 0.2
@@ -78,8 +79,11 @@ class WorkerDaemon:
             port=int(os.getenv("MEMBERSHIP_PORT", "50051")),
         )
 
-        # Currently only support for llamacpp
-        inference_engine = LlamaCppEngine()
+        engine_name = os.getenv("RELAY_ENGINE", "llama.cpp")
+        if engine_name == "mlx":
+            inference_engine: InferenceEngine = MlxEngine()
+        else:
+            inference_engine = LlamaCppEngine()
 
         try:
             weight = float(os.getenv("WORKER_WEIGHT", "0"))
@@ -110,7 +114,7 @@ class WorkerDaemon:
             "role": "worker",
             "node_id": self.node_id,
             "address": self.address,
-            "engine": "llama.cpp",
+            "engine": os.getenv("RELAY_ENGINE", "llama.cpp"),
             "engines": _worker_engines(),
             "models": models,
             "prefix_cache": telemetry.prefix_cache.model_dump(),
