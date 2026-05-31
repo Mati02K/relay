@@ -29,7 +29,11 @@ from framework.baseline import BASELINE_PHASE, run_round_robin_vs_signal
 from framework.client import RelayClient, RoutingRecord
 from framework.cluster import ClusterClient
 from framework.metrics import _percentile, save_records_csv, save_records_json, worker_share
-from framework.report import plot_failure_counts, plot_worker_distribution_phases
+from framework.report import (
+    plot_failure_counts,
+    plot_latency_percentiles_comparison,
+    plot_worker_distribution_phases,
+)
 from framework.workload import send_batch
 
 SCENARIO = "queue"
@@ -97,6 +101,18 @@ async def test_queue_routing_vs_round_robin(
     plot_failure_counts(
         {"round_robin": fails_rr, "queue_on (queue=1)": fails_sig},
         plots_dir, SCENARIO, total=OVERLOAD_REQUESTS,
+    )
+    plot_latency_percentiles_comparison(
+        {"round_robin": baseline, "queue_on": signal}, plots_dir, SCENARIO,
+    )
+
+    # TTFT comparison (successful requests only) — the tail is where routing shows.
+    rr_ttft = [r.ttft_ms for r in baseline if r.error is None]
+    sig_ttft = [r.ttft_ms for r in signal if r.error is None]
+    print(
+        f"\n[{SCENARIO}] TTFT (ms)   round_robin: P50={_percentile(rr_ttft, 50):.0f} "
+        f"P99={_percentile(rr_ttft, 99):.0f}   |   "
+        f"queue_on: P50={_percentile(sig_ttft, 50):.0f} P99={_percentile(sig_ttft, 99):.0f}"
     )
 
     if fails_rr == 0:

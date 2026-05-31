@@ -61,12 +61,11 @@ from telemetry.prefix_cache import (
 )
 
 DEFAULT_JITTER_MAX_MS = float(os.getenv("RELAY_SCHED_JITTER_MAX_MS", "1.0"))
-# Queue depth (q_w) is a raw count of in-flight requests (0..parallel slots).
-# Normalize it to [0, 1] by dividing by this capacity so the queue term shares
-# the same scale as the other [0, 1] signals; values above capacity clamp to 1.0.
-# Defaults to the llama.cpp ``--parallel`` default; set RELAY_SCHED_QUEUE_MAX to
-# match a non-default slot count.
-DEFAULT_QUEUE_MAX = max(1.0, float(os.getenv("RELAY_SCHED_QUEUE_MAX", "4")))
+# Queue depth (q_w) enters the cost raw: the term is ``queue_weight * q_w`` with
+# no normalization or clamp, so a deep backlog keeps driving the decision instead
+# of saturating at 1.0. q_w must be total in-flight (running + waiting) from every
+# engine for cross-engine comparison; tune ``queue_weight`` to set its scale
+# against the other [0, 1] signals.
 
 
 @dataclass
@@ -363,8 +362,7 @@ def _score_worker(
     overlap = _prefix_overlap(matched_tokens, prompt_tokens)
 
     weights = WEIGHTS
-    normalized_queue = min(1.0, max(0, telemetry.qw) / DEFAULT_QUEUE_MAX)
-    queue_term = weights.queue * normalized_queue
+    queue_term = weights.queue * max(0, telemetry.qw)
     prefix_term = weights.prefix_miss * (1.0 - overlap)
     memory_term = weights.memory * telemetry.mw
     jitter_term = weights.jitter * telemetry.jw / jitter_max

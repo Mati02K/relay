@@ -473,6 +473,51 @@ def plot_failure_counts(
     return out
 
 
+# ── TTFT percentiles ──────────────────────────────────────────────────────────
+
+def plot_latency_percentiles_comparison(
+    records_by_label: dict[str, list[RoutingRecord]],
+    output_dir: Path,
+    scenario: str,
+) -> Path:
+    """Grouped bar chart of P50/P90/P99 TTFT for each labelled run (lower = better).
+
+    Only successful requests count toward the percentiles (errored requests have
+    no real TTFT). This is where a routing signal usually shows up — the tail
+    (P99) shrinks when traffic is steered off slow/loaded workers.
+    """
+    plt = _plt()
+    labels = list(records_by_label.keys())
+    pcts = [(50, "P50"), (90, "P90"), (99, "P99")]
+    colors = ["#1976D2", "#D32F2F", "#388E3C", "#7B1FA2"]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    x = range(len(pcts))
+    width = 0.8 / max(len(labels), 1)
+    for i, label in enumerate(labels):
+        ttfts = [r.ttft_ms for r in records_by_label[label] if r.error is None]
+        values = [_percentile(ttfts, pct) for pct, _ in pcts]
+        offset = (i - len(labels) / 2 + 0.5) * width
+        bars = ax.bar([xi + offset for xi in x], values, width, label=label,
+                      color=colors[i % len(colors)])
+        for bar, value in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, value, f"{value:.0f}",
+                    ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([name for _, name in pcts])
+    ax.set_ylabel("TTFT (ms)")
+    ax.set_title(f"{scenario.replace('_', ' ').title()} — TTFT percentiles (lower is better)")
+    ax.legend(title="Run")
+    fig.tight_layout()
+
+    out = output_dir / f"{scenario}_ttft_percentiles.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 # ── Summary JSON ──────────────────────────────────────────────────────────────
 
 def save_summary(

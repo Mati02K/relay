@@ -25,6 +25,13 @@ _METRICS_CANDIDATES_Q: tuple[str, ...] = (
     "llamacpp:requests_processing",
     "llamacpp_requests_processing",
 )
+# Requests accepted but waiting for a free slot. Added to ``requests_processing``
+# so qw reports total in-flight (running + waiting), matching the MLX engine and
+# letting the scheduler compare backlog across engines.
+_METRICS_CANDIDATES_DEFERRED: tuple[str, ...] = (
+    "llamacpp:requests_deferred",
+    "llamacpp_requests_deferred",
+)
 
 # Timeout for the live engine client (shared by the spawn and adopt paths so they
 # can never diverge). It must be generous: streaming generation can hold a slow
@@ -289,8 +296,9 @@ class LlamaCppEngine(InferenceEngine):
             return EngineReportedTelemetry(qw=0)
 
         samples = parse_prometheus_samples(response.text)
-        qv = find_metric(samples, *_METRICS_CANDIDATES_Q)
-        qw = int(qv) if qv is not None else 0
+        processing = find_metric(samples, *_METRICS_CANDIDATES_Q)
+        deferred = find_metric(samples, *_METRICS_CANDIDATES_DEFERRED)
+        qw = int(processing or 0) + int(deferred or 0)
         return EngineReportedTelemetry(qw=qw)
 
     async def generate(self, request: Mapping[str, object]) -> AsyncIterator[str]:
