@@ -26,6 +26,14 @@ _METRICS_CANDIDATES_Q: tuple[str, ...] = (
     "llamacpp_requests_processing",
 )
 
+# Timeout for the live engine client (shared by the spawn and adopt paths so they
+# can never diverge). It must be generous: streaming generation can hold a slow
+# CPU prefill for many seconds before the first token, and a CPU-bound node can
+# take seconds to answer /metrics while every core is busy decoding.
+_ENGINE_HTTP_TIMEOUT = httpx.Timeout(600.0)
+# Short timeout for the one-shot "is a server already running?" adoption probe.
+_ADOPT_PROBE_TIMEOUT = httpx.Timeout(2.0)
+
 
 class LlamaCppEngine(InferenceEngine):
     """Runs ``llama-server`` locally and exposes generate / health / telemetry."""
@@ -118,7 +126,7 @@ class LlamaCppEngine(InferenceEngine):
                 )
                 if killed:
                     logger.info(
-                        "Killed stale process(es) on port {} before starting llama-server | pids={}",
+                        "Killed stale process(es) on port {} before starting | pids={}",
                         self._port,
                         killed,
                     )
@@ -163,7 +171,7 @@ class LlamaCppEngine(InferenceEngine):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            self._http = httpx.AsyncClient(base_url=self.base_url, timeout=httpx.Timeout(600.0))
+            self._http = httpx.AsyncClient(base_url=self.base_url, timeout=_ENGINE_HTTP_TIMEOUT)
 
             deadline = time.monotonic() + float(os.getenv("LLAMA_SERVER_START_TIMEOUT", "120"))
             while time.monotonic() < deadline:
@@ -205,24 +213,28 @@ class LlamaCppEngine(InferenceEngine):
     async def _try_adopt(self) -> bool:
         """Adopt an already-running llama-server on our port without spawning.
 
-        Returns True and sets ``self._http`` when the server is healthy.
-        Returns False and closes the client when it is not responding.
+        Probes with a short timeout, but the adopted live client uses the same
+        generous timeout as the spawn path — a 2s timeout on the live client
+        would silently zero ``/metrics`` (queue depth) and break slow prefills on
+        a CPU-bound node. Returns True and sets ``self._http`` when healthy.
         """
-        client = httpx.AsyncClient(base_url=self.base_url, timeout=httpx.Timeout(2.0))
+        probe = httpx.AsyncClient(base_url=self.base_url, timeout=_ADOPT_PROBE_TIMEOUT)
         try:
-            r = await client.get("/health")
-            if r.status_code == 200:
-                self._http = client
-                logger.info(
-                    "Adopted existing llama-server on port {} | url={}",
-                    self._port,
-                    self.base_url,
-                )
-                return True
+            response = await probe.get("/health")
+            adopted = response.status_code == 200
         except httpx.RequestError:
-            pass
-        await client.aclose()
-        return False
+            adopted = False
+        finally:
+            await probe.aclose()
+        if not adopted:
+            return False
+        self._http = httpx.AsyncClient(base_url=self.base_url, timeout=_ENGINE_HTTP_TIMEOUT)
+        logger.info(
+            "Adopted existing llama-server on port {} | url={}",
+            self._port,
+            self.base_url,
+        )
+        return True
 
     async def _drain_stderr_tail(self, max_bytes: int = 4000) -> str:
         if not self._proc or not self._proc.stderr:
@@ -260,10 +272,20 @@ class LlamaCppEngine(InferenceEngine):
 
         try:
             response = await client.get("/metrics")
-        except httpx.RequestError:
+        except httpx.RequestError as e:
+            logger.warning(
+                "llama-server /metrics unreachable; reporting qw=0 | url={} error={}",
+                self.base_url,
+                e,
+            )
             return EngineReportedTelemetry(qw=0)
 
         if response.status_code != 200:
+            logger.warning(
+                "llama-server /metrics returned HTTP {}; reporting qw=0 | url={}",
+                response.status_code,
+                self.base_url,
+            )
             return EngineReportedTelemetry(qw=0)
 
         samples = parse_prometheus_samples(response.text)

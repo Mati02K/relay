@@ -1,157 +1,72 @@
-"""Thermal pressure routing scenario.
+"""Thermal-pressure routing: round-robin baseline vs the thermal signal.
 
-Observes how the scheduler routes requests as real CPU/GPU temperature rises
-on one worker.  You create thermal load externally (CPU stress tools, running
-a compute-intensive workload) and this test records routing at each phase.
+Apply **real** CPU/GPU thermal load to the target worker (workers[0]) and keep
+it applied for the whole run. The test sends the same short-prompt workload
+twice — once under blind round-robin, once with only ``thermal=1`` — and reports
+how much traffic each policy sends to the hot worker. Thermal-aware routing
+should send noticeably **less** to it.
 
-How to apply thermal load
---------------------------
-CPU stress (Linux):
-  stress-ng --cpu 0 --timeout 120s        # all cores at 100%
-  # or
-  yes > /dev/null &                        # single core spike
-
-GPU stress (NVIDIA):
-  nvidia-smi dmon -s u                     # monitor GPU utilisation
-  # Run a GPU workload like stable diffusion or a CUDA benchmark
-
-Monitor temperature while applying load:
-  watch -n 1 'sensors | grep -E "Core|GPU"'
-  # or
-  nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader -l 1
-
-How to run
-----------
-1. Start the cluster.
-2. On worker-0's machine, start the stress tool.
-3. Wait until temperature rises noticeably (watch sensors).
-4. Run: pytest test/scenarios/test_thermal.py --coordinator http://<host>:8080
-
-The live theta_w from /v1/workers is printed before each phase so you can
-confirm real thermal pressure is registering.
+Apply load on the target worker's machine, e.g.:
+    stress-ng --cpu 0 --timeout 300s        # all cores
+    # or run a sustained GPU workload
+Watch the temperature rise (``sensors`` / ``nvidia-smi``) before running.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
-
+from framework.baseline import run_round_robin_vs_signal
 from framework.client import RelayClient
 from framework.cluster import ClusterClient
-from framework.metrics import (
-    save_records_csv,
-    save_records_json,
-    worker_share,
-)
-from framework.report import (
-    plot_latency_boxes_phases,
-    plot_worker_distribution_phases,
-)
+from framework.metrics import save_records_csv, save_records_json, worker_share
+from framework.report import plot_worker_distribution_phases
 from framework.workload import send_batch
 
 SCENARIO = "thermal"
-REQUESTS_PER_PHASE = 120
+SIGNAL_PHASE = "thermal_on"
+REQUESTS = int(os.getenv("RELAY_TEST_REQUESTS_PER_PHASE", "40"))
 CONCURRENCY = 8
+MAX_TOKENS = int(os.getenv("RELAY_TEST_MAX_TOKENS", "8"))
+SIGNAL_WEIGHTS = {
+    "queue": 0.0, "prefix_miss": 0.0, "memory": 0.0, "jitter": 0.0, "thermal": 1.0, "nu": 0.0,
+}
 
 
 @pytest.mark.asyncio
-async def test_thermal_baseline(
+async def test_thermal_routing_vs_round_robin(
     cluster: ClusterClient,
     relay_client: RelayClient,
     short_prompts: list[Any],
     run_dir: Path,
 ) -> None:
-    """Baseline routing — no thermal pressure applied."""
+    """thermal=1 routes less traffic to a hot worker than blind round-robin."""
     workers = await cluster.wait_for_workers(min_count=2)
-    await cluster.reset_scheduler()
-    await cluster.set_weights(queue=0.0, prefix_miss=0.0, memory=0.0, jitter=0.0, thermal=1.0)
-    _log_telemetry(await cluster.get_workers())
+    target_id = workers[0]["node_id"]
 
-    records = await send_batch(
-        relay_client, short_prompts[:REQUESTS_PER_PHASE],
-        scenario=SCENARIO, phase="baseline", concurrency=CONCURRENCY,
+    async def run_workload(phase: str) -> Any:
+        return await send_batch(
+            relay_client, short_prompts[:REQUESTS], scenario=SCENARIO, phase=phase,
+            concurrency=CONCURRENCY, max_tokens=MAX_TOKENS,
+        )
+
+    baseline, signal = await run_round_robin_vs_signal(
+        cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
     )
-    _save_and_plot(records, run_dir)
-    _print_distribution(records, workers, "baseline")
 
+    rr_share = worker_share(baseline, target_id)
+    sig_share = worker_share(signal, target_id)
+    print(f"\n[{SCENARIO}] hot worker = {target_id}")
+    print(f"  round_robin share to hot worker: {rr_share:.1%}")
+    print(f"  thermal=1   share to hot worker: {sig_share:.1%}")
+    print("  (thermal-aware routing should send LESS to the hot worker)")
 
-@pytest.mark.asyncio
-async def test_thermal_under_load(
-    cluster: ClusterClient,
-    relay_client: RelayClient,
-    short_prompts: list[Any],
-    run_dir: Path,
-) -> None:
-    """Routing while worker-0 CPU/GPU is thermally stressed.
-
-    Run stress-ng or a heavy GPU workload on worker-0 before this test.
-    """
-    workers = await cluster.wait_for_workers(min_count=2)
-    target = workers[0]
-
-    all_workers = await cluster.get_workers()
-    _log_telemetry(all_workers)
-
-    await cluster.reset_scheduler()
-    await cluster.set_weights(queue=0.0, prefix_miss=0.0, memory=0.0, jitter=0.0, thermal=1.0)
-
-    records = await send_batch(
-        relay_client, short_prompts[:REQUESTS_PER_PHASE],
-        scenario=SCENARIO, phase="hot", concurrency=CONCURRENCY,
-    )
-    _save_and_plot(records, run_dir)
-    _print_distribution(records, workers, "hot")
-
-    share = worker_share(records, target["node_id"])
-    print(f"\n  target ({target['node_id']}) share while hot: {share:.1%}")
-    print("  (should be lower than baseline if theta_w is elevated)")
-
-
-@pytest.mark.asyncio
-async def test_thermal_recovery(
-    cluster: ClusterClient,
-    relay_client: RelayClient,
-    short_prompts: list[Any],
-    run_dir: Path,
-) -> None:
-    """Routing after stress tool is stopped and temperature drops."""
-    workers = await cluster.wait_for_workers(min_count=2)
-    await cluster.reset_scheduler()
-    await cluster.set_weights(queue=0.0, prefix_miss=0.0, memory=0.0, jitter=0.0, thermal=1.0)
-    await cluster.wait_telemetry_propagation(seconds=5.0)
-    _log_telemetry(await cluster.get_workers())
-
-    records = await send_batch(
-        relay_client, short_prompts[:REQUESTS_PER_PHASE],
-        scenario=SCENARIO, phase="recovery", concurrency=CONCURRENCY,
-    )
-    _save_and_plot(records, run_dir)
-    _print_distribution(records, workers, "recovery")
-
-
-def _log_telemetry(workers: list[Any]) -> None:
-    for w in workers:
-        t = w.get("telemetry", {})
-        print(f"  [{SCENARIO}] {w['node_id']}  "
-              f"theta_w={t.get('theta_w', '?'):.3f}  mw={t.get('mw', '?'):.3f}")
-
-
-def _save_and_plot(records: Any, run_dir: Path) -> None:
-    save_records_csv(records, run_dir / f"{SCENARIO}_records.csv")
-    save_records_json(records, run_dir / f"{SCENARIO}_records.json")
+    all_records = baseline + signal
+    save_records_csv(all_records, run_dir / f"{SCENARIO}_records.csv")
+    save_records_json(all_records, run_dir / f"{SCENARIO}_records.json")
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
-    plot_worker_distribution_phases(records, SCENARIO, plots_dir)
-    plot_latency_boxes_phases(records, SCENARIO, plots_dir)
-
-
-def _print_distribution(records: Any, workers: list[Any], phase: str) -> None:
-    from framework.metrics import _percentile
-    ttfts = [r.ttft_ms for r in records]
-    print(f"\n  [{SCENARIO}] phase={phase}  n={len(records)}  "
-          f"P50={_percentile(ttfts, 50):.0f}ms  P99={_percentile(ttfts, 99):.0f}ms")
-    for w in workers:
-        share = worker_share(records, w["node_id"])
-        print(f"    {w['node_id']}: {share:.1%}")
+    plot_worker_distribution_phases(all_records, SCENARIO, plots_dir)

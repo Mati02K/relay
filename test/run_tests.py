@@ -49,7 +49,9 @@ def main() -> None:
     )
     parser.add_argument("--coordinator", default="http://localhost:8080",
                         help="Relay coordinator URL (default: http://localhost:8080)")
-    parser.add_argument("--model", default=None, help="Model name for completions")
+    parser.add_argument("--model", default=None,
+                        help="Pin a specific model in requests (optional). Omit it to let any "
+                             "worker serve them — each runs its own loaded model")
     parser.add_argument("--scenarios", nargs="+", choices=_ALL_SIGNALS, metavar="SCENARIO",
                         help="Which signal scenarios to run")
     parser.add_argument("--signals", action="store_true", help="Run all signal scenarios")
@@ -130,6 +132,9 @@ def _run_pytest(
         f"--results-dir={results_dir}",
         "--tb=short",
         "--asyncio-mode=auto",
+        # Stream prints live (per-phase progress) instead of capturing them; a
+        # long run otherwise looks frozen until pytest finishes.
+        "-s",
     ]
     if args.model:
         cmd.append(f"--model={args.model}")
@@ -174,8 +179,8 @@ def _run_locust(coordinator_url: str, results_dir: Path, shape: str) -> int:
 def _plot_locust_results(stats_csv: Path, results_dir: Path, shape: str) -> None:
     """Generate a TTFT-over-time plot from locust stats CSV if pandas is available."""
     try:
-        import pandas as pd
         import matplotlib.pyplot as plt
+        import pandas as pd
 
         df = pd.read_csv(stats_csv)
         if "50%ile (ms)" not in df.columns:
@@ -216,7 +221,6 @@ def _prepare_dataset() -> None:
 
 
 def _write_run_manifest(results_dir: Path, args: argparse.Namespace, exit_code: int) -> None:
-    import os
 
     manifest = {
         "coordinator": args.coordinator,

@@ -18,14 +18,20 @@ quality term is sourced from :mod:`coordinator.router`. ``worker_weight(w)``
 is a per-worker preference advertised by each worker in its metadata;
 default ``0.0`` makes it inert.
 
-Routing also runs two filters before scoring:
+The model chart is gated entirely by ``nu`` (the RouteLLM quality knob). When
+``nu == 0`` the chart is not consulted for routing at all — no model-id filter,
+no input-modality filter, no skill filter — so workers are interchangeable
+compute scored by the base physical-signal cost only. When ``nu > 0`` the chart
+layer turns on and routing runs, before scoring:
 
-1. A hard input-modality filter (text / image / audio / video) — anything
+1. A hard model-id filter — workers that don't serve the requested model id
+   are dropped.
+2. A hard input-modality filter (text / image / audio / video) — anything
    the chart says a model can't accept is dropped.
-2. A soft skill filter (coding / reasoning / instruct) — if at least one
+3. A soft skill filter (coding / reasoning / instruct) — if at least one
    worker advertises every needed skill, only those are scored;
-   otherwise scoring proceeds with the entire input-modality-eligible
-   set so the request still goes somewhere.
+   otherwise scoring proceeds with the entire modality-eligible set so the
+   request still goes somewhere.
 """
 
 from __future__ import annotations
@@ -213,63 +219,68 @@ def choose_worker(
 ) -> WorkerChoice:
     """Choose the lowest-cost worker for an OpenAI-style chat completion request.
 
-    Filters first by requested model, then by required input modalities (hard),
-    then by classifier-detected skills (soft — falls back to the full
-    modality-eligible set if no worker advertises every required skill). The
-    surviving candidates are scored with the paper cost + RouteLLM ``nu``
-    term and the minimum-cost worker wins. Ties are broken by node id to keep
-    choices deterministic.
+    ``nu`` is the master switch for the model chart. When ``nu == 0`` the chart
+    has zero influence: there is **no model-id filter, no input-modality filter,
+    and no skill filter** — every worker is an interchangeable compute target
+    scored by the base physical-signal cost (queue, prefix, memory, jitter,
+    thermal) alone, and round-robin rotates across all of them. When ``nu > 0``
+    the whole chart layer turns on: hard model-id and input-modality filters,
+    the soft skill filter, and the RouteLLM quality term. Surviving candidates
+    are scored and the minimum-cost worker wins, ties broken by node id.
     """
     if not workers:
         raise SchedulingError("No workers registered")
-    requested_model = _requested_model(request)
-    required_modalities = detect_request_modalities(request)
     classification = classify(request)
 
     worker_entries: list[tuple[WorkerSnapshot, ModelEntry]] = [
         (worker, _entry_for_worker(worker)) for worker in workers
     ]
 
-    model_eligible = [
-        (worker, entry)
-        for worker, entry in worker_entries
-        if worker.supports_model(requested_model)
-    ]
-    if not model_eligible:
-        if requested_model:
-            raise SchedulingError(f"No workers can serve requested model '{requested_model}'")
-        raise SchedulingError("No workers can serve this request")
+    if WEIGHTS.nu > 0.0:
+        # Chart on: enforce model-id then input-modality eligibility (hard).
+        requested_model = _requested_model(request)
+        required_modalities = detect_request_modalities(request)
 
-    modality_eligible = [
-        (worker, entry)
-        for worker, entry in model_eligible
-        if required_modalities.issubset(entry.input_modalities)
-    ]
-    if not modality_eligible:
-        non_text = sorted(required_modalities - {"text"})
-        if non_text:
-            raise SchedulingError(
-                f"No workers can serve required modalities {non_text}"
-                + (f" for model '{requested_model}'" if requested_model else "")
-            )
-        raise SchedulingError("No workers can serve this request")
+        model_eligible = [
+            (worker, entry)
+            for worker, entry in worker_entries
+            if worker.supports_model(requested_model)
+        ]
+        if not model_eligible:
+            if requested_model:
+                raise SchedulingError(f"No workers can serve requested model '{requested_model}'")
+            raise SchedulingError("No workers can serve this request")
+
+        eligible = [
+            (worker, entry)
+            for worker, entry in model_eligible
+            if required_modalities.issubset(entry.input_modalities)
+        ]
+        if not eligible:
+            non_text = sorted(required_modalities - {"text"})
+            if non_text:
+                raise SchedulingError(
+                    f"No workers can serve required modalities {non_text}"
+                    + (f" for model '{requested_model}'" if requested_model else "")
+                )
+            raise SchedulingError("No workers can serve this request")
+    else:
+        # Chart off: workers are interchangeable, no model/modality filter.
+        eligible = worker_entries
 
     if SCHEDULER_MODE == "round_robin":
-        return _round_robin_choice(modality_eligible)
+        return _round_robin_choice(eligible)
 
-    # `nu` is the master switch for chart-driven routing. When nu == 0 the
-    # quality cost term is already zero; we also skip the soft skill filter so
-    # the chart has zero influence and the scheduler reduces to the base
-    # 5-term paper formula. nu > 0 turns both back on together.
+    # Soft skill filter is part of the chart layer, so it too is nu-gated.
     if WEIGHTS.nu > 0.0:
         skill_preferred = [
             (worker, entry)
-            for worker, entry in modality_eligible
+            for worker, entry in eligible
             if classification.skills_needed.issubset(entry.skills)
         ]
-        scoring_pool = skill_preferred if skill_preferred else modality_eligible
+        scoring_pool = skill_preferred if skill_preferred else eligible
     else:
-        scoring_pool = modality_eligible
+        scoring_pool = eligible
 
     prompt_text = request_to_prefix_text(request)
     jitter_max = _jitter_max([worker for worker, _ in scoring_pool])

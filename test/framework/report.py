@@ -15,7 +15,6 @@ from typing import Any
 from framework.client import RoutingRecord
 from framework.metrics import (
     _percentile,
-    all_phase_stats,
     conversation_affinity,
     latency_cdf,
     throughput_rps,
@@ -48,30 +47,49 @@ def plot_worker_distribution_phases(
     scenario: str,
     output_dir: Path,
 ) -> Path:
-    """Grouped bar chart: worker share per phase."""
+    """Grouped bar chart: successful routed-request worker share per phase."""
     plt = _plt()
-    stats = all_phase_stats(records)
-    if not stats:
+    phases = list(dict.fromkeys(r.phase for r in records))
+    if not phases:
         return output_dir / f"{scenario}_worker_distribution.png"
 
-    all_workers = sorted({w for s in stats for w in s.get("worker_shares", {})})
-    phases = [s["phase"] for s in stats]
+    shares_by_phase: dict[str, dict[str, float]] = {}
+    for phase in phases:
+        counts: dict[str, int] = defaultdict(int)
+        for record in records:
+            if record.phase == phase and record.worker:
+                counts[record.worker] += 1
+        total = sum(counts.values())
+        shares_by_phase[phase] = (
+            {worker: count / total for worker, count in counts.items()}
+            if total
+            else {}
+        )
+
+    all_workers = sorted({w for shares in shares_by_phase.values() for w in shares})
     x = range(len(phases))
     width = 0.8 / max(len(all_workers), 1)
 
     fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
     colors = plt.cm.Set2.colors  # type: ignore[attr-defined]
     for i, worker in enumerate(all_workers):
-        shares = [s.get("worker_shares", {}).get(worker, 0) * 100 for s in stats]
+        shares = [shares_by_phase[phase].get(worker, 0) * 100 for phase in phases]
         offset = (i - len(all_workers) / 2 + 0.5) * width
-        ax.bar([xi + offset for xi in x], shares, width, label=worker, color=colors[i % len(colors)])
+        ax.bar(
+            [xi + offset for xi in x],
+            shares,
+            width,
+            label=worker,
+            color=colors[i % len(colors)],
+        )
 
     ax.set_xticks(list(x))
     ax.set_xticklabels(phases, rotation=15, ha="right")
-    ax.set_ylabel("Routing share (%)")
+    ax.set_ylabel("Routed request share (%)")
     ax.set_ylim(0, 110)
     ax.set_title(f"{scenario.replace('_', ' ').title()} — Worker Distribution per Phase")
-    ax.legend(title="Worker", bbox_to_anchor=(1.02, 1), loc="upper left")
+    if all_workers:
+        ax.legend(title="Worker", bbox_to_anchor=(1.02, 1), loc="upper left")
     fig.tight_layout()
 
     out = output_dir / f"{scenario}_worker_distribution.png"
@@ -94,7 +112,7 @@ def plot_latency_boxes_phases(
     phases_filtered = [p for p, d in zip(phases, data) if d]
 
     fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
-    ax.boxplot(data, labels=phases_filtered, patch_artist=True)
+    ax.boxplot(data, tick_labels=phases_filtered, patch_artist=True)
     ax.set_xlabel("Phase")
     ax.set_ylabel("TTFT (ms)")
     ax.set_title(f"{scenario.replace('_', ' ').title()} — TTFT Distribution per Phase")
@@ -119,7 +137,13 @@ def plot_pressure_vs_routing(
     fig, ax1 = plt.subplots(figsize=(_FIG_W, _FIG_H))
 
     valid_pressures = [p if p is not None else 0.0 for p in pressure_values]
-    ax1.plot(phase_names, [s * 100 for s in target_shares], "o-b", linewidth=2, label="Worker share %")
+    ax1.plot(
+        phase_names,
+        [s * 100 for s in target_shares],
+        "o-b",
+        linewidth=2,
+        label="Worker share %",
+    )
     ax1.set_ylabel("Target worker routing share (%)", color="blue")
     ax1.set_ylim(0, 105)
     ax1.tick_params(axis="y", labelcolor="blue")
@@ -183,7 +207,10 @@ def plot_prefix_cache_heatmap(
     )
     ax.set_xlabel("Turn")
     ax.set_ylabel("Conversation")
-    ax.set_title("Prefix Cache Affinity — Worker per Turn per Conversation\n(same color = same worker)")
+    ax.set_title(
+        "Prefix Cache Affinity — Worker per Turn per Conversation\n"
+        "(same color = same worker)"
+    )
 
     out = output_dir / "prefix_cache_heatmap.png"
     fig.tight_layout()
@@ -232,12 +259,9 @@ def plot_quality_routing_scatter(
     output_dir: Path,
 ) -> Path:
     """Scatter plot: prompt complexity vs worker."""
-    import numpy as np  # type: ignore[import-untyped]
-
     plt = _plt()
 
     workers = sorted({r.worker for r in records if r.worker})
-    worker_idx = {w: i for i, w in enumerate(workers)}
     colors = plt.cm.Set1.colors  # type: ignore[attr-defined]
 
     fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
@@ -416,6 +440,39 @@ def plot_worker_heatmap_time(
     return out
 
 
+# ── Failure comparison ────────────────────────────────────────────────────────
+
+def plot_failure_counts(
+    counts: dict[str, int],
+    output_dir: Path,
+    scenario: str,
+    total: int | None = None,
+) -> Path:
+    """Bar chart comparing failed-request counts (503/timeout) across runs."""
+    plt = _plt()
+    labels = list(counts.keys())
+    values = [counts[label] for label in labels]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    colors = ["#f44336" if v > 0 else "#4caf50" for v in values]
+    bars = ax.bar(labels, values, color=colors, edgecolor="white")
+    for bar, value in zip(bars, values):
+        annotation = f"{value}" + (f" / {total}" if total else "")
+        ax.text(bar.get_x() + bar.get_width() / 2, value, annotation,
+                ha="center", va="bottom", fontsize=12)
+
+    ax.set_ylabel("Failed requests (503 / timeout)")
+    ax.set_ylim(0, max(values + [1]) * 1.25)
+    ax.set_title(f"{scenario.replace('_', ' ').title()} — Failed Requests per Run")
+    fig.tight_layout()
+
+    out = output_dir / f"{scenario}_failures.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 # ── Summary JSON ──────────────────────────────────────────────────────────────
 
 def save_summary(
@@ -429,7 +486,7 @@ def save_summary(
 
     summary = {
         "run_id": run_dir.name,
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "git_sha": git_sha,
         "coordinator": coordinator_url,
         "scenarios": scenario_results,

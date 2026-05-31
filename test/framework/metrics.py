@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -128,10 +129,20 @@ def save_records_csv(records: list[RoutingRecord], path: Path) -> None:
 
 def save_records_json(records: list[RoutingRecord], path: Path) -> None:
     """Write all records to a JSON file."""
-    import json
-
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps([r.as_dict() for r in records], indent=2))
+
+
+def load_records_json(path: Path) -> list[RoutingRecord]:
+    """Load previously saved records from ``path``, or return [] if absent.
+
+    Used by multi-phase scenarios so that each phase appends to the records
+    written by earlier phases instead of overwriting them.
+    """
+    if not path.exists():
+        return []
+    raw = json.loads(path.read_text())
+    return [RoutingRecord(**item) for item in raw]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

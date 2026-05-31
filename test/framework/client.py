@@ -62,6 +62,23 @@ class RelayClient:
     def __init__(self, base_url: str, timeout: float = 120.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return a shared async client, recreating it if it was closed.
+
+        Reusing one client (and its connection pool) across requests avoids the
+        cost of opening a fresh TCP/TLS connection for every completion.
+        """
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the shared async client if one is open."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
     async def chat_completion(
         self,
@@ -100,37 +117,37 @@ class RelayClient:
         error: str | None = None
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream("POST", url, json=body) as response:
-                    if response.status_code >= 400:
-                        body_text = (await response.aread()).decode("utf-8", errors="replace")
-                        error = f"HTTP {response.status_code}: {body_text[:200]}"
-                    else:
-                        worker = response.headers.get("x-relay-worker", "")
-                        model_id = response.headers.get("x-relay-model", "")
-                        cost = _parse_float(response.headers.get("x-relay-cost", "0"))
-                        overlap = _parse_float(response.headers.get("x-relay-overlap", "0"))
-                        complexity = _parse_float(response.headers.get("x-relay-complexity", "0"))
-                        prompt_tokens = int(
-                            _parse_float(response.headers.get("x-relay-prompt-tokens", "0"))
-                        )
-                        matched_tokens = int(
-                            _parse_float(response.headers.get("x-relay-matched-tokens", "0"))
-                        )
-                        attempts = int(
-                            _parse_float(response.headers.get("x-relay-attempts", "1"))
-                        )
+            client = self._get_client()
+            async with client.stream("POST", url, json=body) as response:
+                if response.status_code >= 400:
+                    body_text = (await response.aread()).decode("utf-8", errors="replace")
+                    error = f"HTTP {response.status_code}: {body_text[:200]}"
+                else:
+                    worker = response.headers.get("x-relay-worker", "")
+                    model_id = response.headers.get("x-relay-model", "")
+                    cost = _parse_float(response.headers.get("x-relay-cost", "0"))
+                    overlap = _parse_float(response.headers.get("x-relay-overlap", "0"))
+                    complexity = _parse_float(response.headers.get("x-relay-complexity", "0"))
+                    prompt_tokens = int(
+                        _parse_float(response.headers.get("x-relay-prompt-tokens", "0"))
+                    )
+                    matched_tokens = int(
+                        _parse_float(response.headers.get("x-relay-matched-tokens", "0"))
+                    )
+                    attempts = int(
+                        _parse_float(response.headers.get("x-relay-attempts", "1"))
+                    )
 
-                        async for raw_line in response.aiter_lines():
-                            line = raw_line.strip()
-                            if not line or not line.startswith("data: "):
-                                continue
-                            payload = line[len("data: "):]
-                            if payload == "[DONE]":
-                                break
-                            if not first_content_seen and _has_content_delta(payload):
-                                ttft_ms = (time.perf_counter() - t_start) * 1000.0
-                                first_content_seen = True
+                    async for raw_line in response.aiter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        payload = line[len("data: "):]
+                        if payload == "[DONE]":
+                            break
+                        if not first_content_seen and _has_content_delta(payload):
+                            ttft_ms = (time.perf_counter() - t_start) * 1000.0
+                            first_content_seen = True
         except Exception as exc:
             error = str(exc)[:300]
 

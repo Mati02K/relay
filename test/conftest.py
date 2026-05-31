@@ -12,6 +12,9 @@ Usage
 
 from __future__ import annotations
 
+# ruff: noqa: E402, I001
+
+import asyncio
 import datetime
 import subprocess
 import sys
@@ -19,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import pytest_asyncio
 
 # Make `framework` importable from within test files
 _TEST_DIR = Path(__file__).parent
@@ -29,6 +31,7 @@ if str(_TEST_DIR) not in sys.path:
 from framework.client import RelayClient
 from framework.cluster import ClusterClient
 from framework.datasets import ShareGPTDataset
+from framework.warmup import warm_up_workers
 
 
 # ── CLI options ───────────────────────────────────────────────────────────────
@@ -60,6 +63,13 @@ def coordinator_url(request: Any) -> str:
 
 @pytest.fixture(scope="session")
 def model_name(request: Any) -> str | None:
+    """Model id to pin in requests, or None to let any worker serve them.
+
+    Defaults to None: Relay routes a no-model request to any eligible worker
+    (each serves its own loaded model), which is what the routing scenarios want
+    so every worker participates — including on a heterogeneous cluster where the
+    workers run different models. Pass ``--model`` only to force a specific one.
+    """
     return request.config.getoption("--model")  # type: ignore[no-any-return]
 
 
@@ -103,6 +113,26 @@ def relay_client(coordinator_url: str, model_name: str | None) -> RelayClient:
 
         client.chat_completion = _with_model  # type: ignore[method-assign]
     return client
+
+
+# ── Warm-up ───────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session", autouse=True)
+def reset_and_warm(cluster: ClusterClient) -> None:
+    """Reset scheduler state, then prime every worker once (autouse, session-scoped).
+
+    First clears scheduler weights, mode, AND per-worker weight overrides so a
+    previous (possibly killed) run cannot leak routing state into this one — that
+    state is in-memory on the coordinator and survives between test runs. Then
+    sends dataset-free prompts directly to each worker so engines are loaded and
+    telemetry has settled before the first phase is measured. Runs its own event
+    loop so it completes before any test's loop starts.
+    """
+    async def _prepare() -> None:
+        await cluster.full_reset()
+        await warm_up_workers(cluster, model=None)
+
+    asyncio.run(_prepare())
 
 
 # ── Dataset fixtures ──────────────────────────────────────────────────────────
