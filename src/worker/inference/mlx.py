@@ -17,6 +17,7 @@ from telemetry.schemas import EngineReportedTelemetry
 from worker.inference.base import EngineHealth, InferenceEngine
 
 _DEFAULT_PORT = 9081
+_HEALTH_TIMEOUT = 5.0  # short timeout for /v1/models probes so a frozen server is detected quickly
 
 
 class MlxEngine(InferenceEngine):
@@ -164,7 +165,10 @@ class MlxEngine(InferenceEngine):
         """Read captured output from the merged stdout+stderr stream."""
         if not self._proc or not self._proc.stdout:
             return ""
-        data = await self._proc.stdout.read(max_bytes)
+        try:
+            data = await asyncio.wait_for(self._proc.stdout.read(max_bytes), timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            return ""
         return data.decode(errors="replace")
 
     async def health(self) -> EngineHealth:
@@ -179,7 +183,7 @@ class MlxEngine(InferenceEngine):
         if not client:
             return EngineHealth(status=False, detail="mlx_lm.server not started", engine="mlx")
         try:
-            r = await client.get("/v1/models")
+            r = await client.get("/v1/models", timeout=_HEALTH_TIMEOUT)
             if r.status_code == 200:
                 return EngineHealth(status=True, detail="ok", engine="mlx")
             return EngineHealth(
@@ -187,7 +191,7 @@ class MlxEngine(InferenceEngine):
                 detail=f"HTTP {r.status_code}: {r.text[:200]}",
                 engine="mlx",
             )
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.TimeoutException) as e:
             return EngineHealth(status=False, detail=str(e), engine="mlx")
 
     async def get_engine_telemetry(self) -> EngineReportedTelemetry:

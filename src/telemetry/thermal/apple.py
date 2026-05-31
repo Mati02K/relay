@@ -103,7 +103,10 @@ class MacOSThermalStateCollector:
                 timeout=_PROBE_TIMEOUT_SECONDS,
             )
         except TimeoutError:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
             await process.wait()
             return []
 
