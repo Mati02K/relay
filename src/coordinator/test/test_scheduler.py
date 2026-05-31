@@ -60,14 +60,16 @@ def test_choose_worker_negative_weight_deprioritizes() -> None:
 
 def test_choose_worker_weight_clamped_at_boundaries() -> None:
     request = _request("hello")
-    # qw differs by 2; out-of-range weight 5.0 would otherwise flip the choice,
-    # but clamping caps the bonus at 1.0, so the lower-queue worker still wins.
-    busy_preferred = _worker("busy", qw=5, weight=5.0)
-    idle_plain = _worker("idle", qw=3)
+    # Both idle, so only worker_weight differs. An out-of-range weight 5.0 is
+    # clamped to the +1.0 cap, so it only *ties* the worker already at the cap
+    # rather than beating it — proven by the lower node id winning the tie. An
+    # unclamped 5.0 would have made "zzz" the cheapest and won outright.
+    maxed = _worker("aaa", qw=0, weight=1.0)
+    over_cap = _worker("zzz", qw=0, weight=5.0)
 
-    choice = choose_worker(request, [busy_preferred, idle_plain])
+    choice = choose_worker(request, [maxed, over_cap])
 
-    assert choice.worker.node_id == "idle"
+    assert choice.worker.node_id == "aaa"
 
 
 def _request(content: str) -> dict[str, object]:
