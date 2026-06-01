@@ -61,8 +61,10 @@ async def test_prefix_cache_vs_round_robin(
         cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
     )
 
-    affinity_rr = conversation_affinity(baseline)["overall_affinity"]
-    affinity_sig = conversation_affinity(signal)["overall_affinity"]
+    aff_rr = conversation_affinity(baseline)
+    aff_sig = conversation_affinity(signal)
+    affinity_rr = aff_rr["overall_affinity"]
+    affinity_sig = aff_sig["overall_affinity"]
     print(f"\n[{SCENARIO}] round_robin affinity: {affinity_rr:.1%}")
     print(f"[{SCENARIO}] prefix_on   affinity: {affinity_sig:.1%}")
 
@@ -72,7 +74,7 @@ async def test_prefix_cache_vs_round_robin(
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
     plot_prefix_cache_heatmap(signal, plots_dir)
-    _plot_affinity_comparison(affinity_rr, conversation_affinity(signal), plots_dir)
+    _plot_affinity_comparison(aff_rr, aff_sig, plots_dir)
 
     assert affinity_sig >= 0.85, f"prefix_on affinity {affinity_sig:.1%} < 85% threshold"
     print(
@@ -81,33 +83,48 @@ async def test_prefix_cache_vs_round_robin(
     )
 
 
-def _plot_affinity_comparison(rr_affinity: float, sig_affinity: dict, plots_dir: Path) -> None:
-    """Bar chart: prefix-on per-conversation affinity vs the round-robin baseline line."""
+def _plot_affinity_comparison(rr_affinity: dict, sig_affinity: dict, plots_dir: Path) -> None:
+    """Two-bar overall comparison (round-robin vs prefix on) with per-conversation dots.
+
+    Each bar is the overall same-worker rate; the white dots scattered on it are
+    the per-conversation rates — so you see both the headline number and how
+    consistent it is (prefix-on dots cluster at 100%, round-robin dots scatter low).
+    """
     try:
+        import random as _random
+
         import matplotlib.pyplot as plt
     except ImportError:
         return
 
-    per_conv = sig_affinity["per_conversation"]
-    conv_ids = sorted(per_conv)
-    rates = [per_conv[c] * 100 for c in conv_ids]
-    overall = sig_affinity["overall_affinity"] * 100
-    x = range(len(conv_ids))
+    labels = ["round-robin", "prefix on"]
+    colors = ["#EF5350", "#42A5F5"]
+    overalls = [rr_affinity["overall_affinity"] * 100, sig_affinity["overall_affinity"] * 100]
+    per_conv = [
+        [v * 100 for v in rr_affinity["per_conversation"].values()],
+        [v * 100 for v in sig_affinity["per_conversation"].values()],
+    ]
+    x = [0, 1]
 
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.bar(x, rates, color="#42A5F5", alpha=0.85, label="Prefix on")
-    ax.axhline(rr_affinity * 100, color="#EF5350", linestyle="--", linewidth=1.8,
-               label=f"Round-robin baseline ({rr_affinity * 100:.1f}%)")
-    ax.axhline(85, color="navy", linestyle=":", linewidth=1.5, label="85% threshold")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels([c.split("_")[-1] for c in conv_ids], rotation=45, ha="right", fontsize=8)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.bar(x, overalls, width=0.55, color=colors, alpha=0.85, zorder=2)
+    for xi, value in zip(x, overalls):
+        ax.text(xi, value + 1.5, f"{value:.1f}%", ha="center", va="bottom",
+                fontsize=14, fontweight="bold")
+
+    rng = _random.Random(42)
+    for xi, values in zip(x, per_conv):
+        xs = [xi + rng.uniform(-0.13, 0.13) for _ in values]
+        ax.scatter(xs, values, color="white", edgecolor="#333", s=32, zorder=3, alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=12)
     ax.set_ylabel("Same-worker rate (%)")
-    ax.set_ylim(0, 110)
+    ax.set_ylim(0, 112)
     ax.set_title(
-        f"Prefix Cache Affinity — prefix on per conversation\n"
-        f"round-robin: {rr_affinity * 100:.1f}%  |  prefix on: {overall:.1f}%"
+        "Prefix Cache Affinity — round-robin vs prefix on\n"
+        "(bar = overall · dots = per conversation)"
     )
-    ax.legend()
     fig.tight_layout()
     fig.savefig(plots_dir / "prefix_cache_affinity_comparison.png", dpi=150)
     plt.close(fig)

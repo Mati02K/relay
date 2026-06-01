@@ -50,7 +50,6 @@ async def test_jitter_routing_vs_round_robin(
 ) -> None:
     """jitter=1 routes less traffic to a high-jitter worker than blind round-robin."""
     workers = await cluster.wait_for_workers(min_count=2)
-    target_id = workers[0]["node_id"]
 
     print(f"\n[{SCENARIO}] waiting {EMA_SETTLE_SECONDS:.0f}s for the jitter EMA to settle…")
     await asyncio.sleep(EMA_SETTLE_SECONDS)
@@ -67,12 +66,13 @@ async def test_jitter_routing_vs_round_robin(
         cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
     )
 
-    rr_share = worker_share(baseline, target_id)
-    sig_share = worker_share(signal, target_id)
-    print(f"\n[{SCENARIO}] jittery worker = {target_id}")
-    print(f"  round_robin share to jittery worker: {rr_share:.1%}")
-    print(f"  jitter=1    share to jittery worker: {sig_share:.1%}")
-    print("  (jitter-aware routing should send LESS to the jittery worker)")
+    print(f"\n[{SCENARIO}] worker share  round_robin → {SIGNAL_PHASE}  "
+          f"(jitter-aware routing sends less to the jittery node):")
+    for w in workers:
+        nid = w["node_id"]
+        rr = worker_share(baseline, nid)
+        sig = worker_share(signal, nid)
+        print(f"    {nid:16} {rr:6.1%} → {sig:6.1%}   ({sig - rr:+.1%})")
 
     all_records = baseline + signal
     save_records_csv(all_records, run_dir / f"{SCENARIO}_records.csv")

@@ -6,7 +6,7 @@ throughput than the simpler baselines.
 
 Configurations
 --------------
-relay         Cost-function scheduling (default mode, all weights = 1.0)
+relay         Cost-function scheduling with the tuned RELAY_WEIGHTS (nu=0)
 round_robin   ``RELAY_SCHED_MODE=round_robin`` — blind rotation
 single_worker All worker-weight overrides set so only one worker receives
               traffic (worker_weight = 1.0 for chosen, −1.0 for rest).
@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from framework.client import RelayClient
 from framework.cluster import ClusterClient
 from framework.metrics import (
@@ -42,7 +41,6 @@ from framework.metrics import (
     save_records_csv,
     save_records_json,
     throughput_rps,
-    worker_share,
 )
 from framework.report import (
     plot_latency_cdf_comparison,
@@ -55,6 +53,11 @@ from framework.workload import send_batch
 CONCURRENCY = 12
 PROMPTS_PER_CONFIG = 500
 MAX_TOKENS = 64
+# Tuned cost-function weights the "relay" config is evaluated with (vs the
+# round-robin / single-worker baselines). nu=0 → pure physical-signal routing.
+RELAY_WEIGHTS = {
+    "queue": 1.0, "prefix_miss": 0.6, "memory": 0.5, "jitter": 0.4, "thermal": 0.3, "nu": 0.0,
+}
 
 
 @pytest.mark.asyncio
@@ -70,9 +73,11 @@ async def test_relay_outperforms_baselines(
 
     records_by_config: dict[str, Any] = {}
 
-    # ── Config 1: Relay cost routing ─────────────────────────────────────────
+    # ── Config 1: Relay cost routing (tuned weights) ─────────────────────────
     print(f"\n[comparison] Running relay config ({PROMPTS_PER_CONFIG} prompts)…")
-    await cluster.reset_scheduler()  # cost mode, default weights
+    await cluster.full_reset()  # cost mode, clear overrides, weights → defaults
+    await cluster.set_weights(**RELAY_WEIGHTS)  # then apply the tuned weights
+    print(f"[comparison] relay weights: {RELAY_WEIGHTS}")
     relay_records = await send_batch(
         relay_client,
         prompt_subset,
@@ -85,7 +90,7 @@ async def test_relay_outperforms_baselines(
     _print_stats("relay", relay_records)
 
     # ── Config 2: Round-robin ─────────────────────────────────────────────────
-    print(f"[comparison] Running round_robin config…")
+    print("[comparison] Running round_robin config…")
     await cluster.set_mode("round_robin")
     rr_records = await send_batch(
         relay_client,
@@ -100,7 +105,7 @@ async def test_relay_outperforms_baselines(
     await cluster.set_mode("cost")
 
     # ── Config 3: Single worker ───────────────────────────────────────────────
-    print(f"[comparison] Running single_worker config…")
+    print("[comparison] Running single_worker config…")
     # Pin all traffic to workers[0] by giving it maximum preference
     # and maximum penalty to all others.
     chosen = workers[0]["node_id"]

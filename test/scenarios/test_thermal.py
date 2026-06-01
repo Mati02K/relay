@@ -45,7 +45,6 @@ async def test_thermal_routing_vs_round_robin(
 ) -> None:
     """thermal=1 routes less traffic to a hot worker than blind round-robin."""
     workers = await cluster.wait_for_workers(min_count=2)
-    target_id = workers[0]["node_id"]
 
     async def run_workload(phase: str) -> Any:
         return await send_batch(
@@ -57,12 +56,13 @@ async def test_thermal_routing_vs_round_robin(
         cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
     )
 
-    rr_share = worker_share(baseline, target_id)
-    sig_share = worker_share(signal, target_id)
-    print(f"\n[{SCENARIO}] hot worker = {target_id}")
-    print(f"  round_robin share to hot worker: {rr_share:.1%}")
-    print(f"  thermal=1   share to hot worker: {sig_share:.1%}")
-    print("  (thermal-aware routing should send LESS to the hot worker)")
+    print(f"\n[{SCENARIO}] worker share  round_robin → {SIGNAL_PHASE}  "
+          f"(thermal-aware routing sends less to the hot node):")
+    for w in workers:
+        nid = w["node_id"]
+        rr = worker_share(baseline, nid)
+        sig = worker_share(signal, nid)
+        print(f"    {nid:16} {rr:6.1%} → {sig:6.1%}   ({sig - rr:+.1%})")
 
     all_records = baseline + signal
     save_records_csv(all_records, run_dir / f"{SCENARIO}_records.csv")
