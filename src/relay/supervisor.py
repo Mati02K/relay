@@ -281,6 +281,16 @@ def _membership_process_specs(
                 "new",
                 "--initial-cluster-token",
                 config.cluster_id,
+                # Large quota so the high-rate telemetry writes don't hit NOSPACE,
+                # plus periodic auto-compaction so old MVCC revisions are reclaimed
+                # and the DB stays bounded regardless of uptime. Both override-able
+                # via env for tuning.
+                "--quota-backend-bytes",
+                os.getenv("RELAY_ETCD_QUOTA_BYTES", str(10 * 1024**3)),
+                "--auto-compaction-mode",
+                "periodic",
+                "--auto-compaction-retention",
+                os.getenv("RELAY_ETCD_COMPACTION_RETENTION", "5m"),
             ],
             env=etcd_env,
             log_path=paths.logs / "etcd.log",

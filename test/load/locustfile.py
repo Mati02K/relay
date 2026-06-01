@@ -140,47 +140,38 @@ def _has_content(payload: str) -> bool:
         return False
 
 
-# ── Load shapes ───────────────────────────────────────────────────────────────
-
-class RampShape(LoadTestShape):
-    """Gradual ramp from 1 to 50 users over 3 minutes, then hold 2 minutes.
-
-    Use: RELAY_LOAD_SHAPE=ramp
-    """
-
-    stages = [
+# ── Load shape ────────────────────────────────────────────────────────────────
+# Stage tables per shape. A stage applies until ``duration`` seconds of run time.
+#   ramp      gradual 5 → 50 users over 3 min, hold 2 min
+#   spike     5 users → instant burst to 80 → back to 5
+#   sustained constant 40 users for 10 min (stability / soak)
+_SHAPES: dict[str, list[dict[str, int]]] = {
+    "ramp": [
         {"duration": 30,  "users": 5,  "spawn_rate": 5},
         {"duration": 60,  "users": 15, "spawn_rate": 5},
         {"duration": 120, "users": 30, "spawn_rate": 5},
         {"duration": 180, "users": 50, "spawn_rate": 5},
         {"duration": 300, "users": 50, "spawn_rate": 1},
-    ]
-
-    def tick(self) -> tuple[int, float] | None:
-        run_time = self.get_run_time()
-        for stage in self.stages:
-            if run_time < stage["duration"]:
-                return stage["users"], stage["spawn_rate"]
-        return None
-
-
-class SpikeShape(LoadTestShape):
-    """Flat baseline → instant spike → back to baseline.
-
-    Use: RELAY_LOAD_SHAPE=spike
-
-    Timeline
-    --------
-    0–60s    5 users  (warm-up / baseline)
-    60–75s   80 users (spike)
-    75–180s  5 users  (recovery)
-    """
-
-    stages = [
+    ],
+    "spike": [
         {"duration": 60,  "users": 5,  "spawn_rate": 5},
         {"duration": 75,  "users": 80, "spawn_rate": 80},
         {"duration": 180, "users": 5,  "spawn_rate": 10},
-    ]
+    ],
+    "sustained": [
+        {"duration": 600, "users": 40, "spawn_rate": 10},
+    ],
+}
+
+
+class RelayLoadShape(LoadTestShape):
+    """The single load shape, selected at import time by ``RELAY_LOAD_SHAPE``.
+
+    Locust errors if a file defines more than one ``LoadTestShape``, so there is
+    exactly one class here; its stage table is chosen from :data:`_SHAPES`.
+    """
+
+    stages = _SHAPES.get(os.getenv("RELAY_LOAD_SHAPE", "ramp"), _SHAPES["ramp"])
 
     def tick(self) -> tuple[int, float] | None:
         run_time = self.get_run_time()
@@ -188,32 +179,3 @@ class SpikeShape(LoadTestShape):
             if run_time < stage["duration"]:
                 return stage["users"], stage["spawn_rate"]
         return None
-
-
-class SustainedShape(LoadTestShape):
-    """Constant 40 concurrent users for 10 minutes to test stability.
-
-    Use: RELAY_LOAD_SHAPE=sustained
-    """
-
-    def tick(self) -> tuple[int, float] | None:
-        run_time = self.get_run_time()
-        if run_time < 600:
-            return 40, 10
-        return None
-
-
-# Select shape from env var (defaults to ramp)
-_SHAPE_MAP = {
-    "ramp": RampShape,
-    "spike": SpikeShape,
-    "sustained": SustainedShape,
-}
-_selected = os.getenv("RELAY_LOAD_SHAPE", "ramp")
-if _selected in _SHAPE_MAP:
-    # Monkey-patch: locust picks up the first LoadTestShape subclass it finds
-    # in the file.  Replace the others so only the selected one is active.
-    _active_cls = _SHAPE_MAP[_selected]
-    for _name, _cls in _SHAPE_MAP.items():
-        if _cls is not _active_cls:
-            _cls.tick = lambda self: None  # type: ignore[method-assign]

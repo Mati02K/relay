@@ -28,8 +28,16 @@ COORDINATOR_PORT: int = int(os.getenv("COORDINATOR_PORT", "8080"))
 ACTIVE_COORDINATOR_KEY: str = "/relay/active-coordinator"
 SCHEDULE_MAX_ATTEMPTS: int = max(1, int(os.getenv("RELAY_SCHEDULE_MAX_ATTEMPTS", "3")))
 WORKER_HEALTH_TIMEOUT_SECONDS: float = float(os.getenv("RELAY_WORKER_HEALTH_TIMEOUT", "2.0"))
+# How often the background monitor probes every worker's /health, and how long a
+# cached result stays usable. Requests read the cache instead of probing inline,
+# so the /health probe rate is fixed (workers / interval) regardless of request
+# rate — a burst no longer fans out into a storm of probes that drops workers.
+HEALTH_PROBE_INTERVAL_SECONDS: float = float(os.getenv("RELAY_HEALTH_PROBE_INTERVAL", "1.0"))
+HEALTH_STALE_AFTER_SECONDS: float = float(os.getenv("RELAY_HEALTH_STALE_AFTER", "5.0"))
 
 membershipClient: EtcdMembership | None = None
+# Background-refreshed worker health, keyed by node id: (monotonic_ts, state).
+_health_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 jitterProbe: JitterProbe | None = None
 networkLayer: NetworkLayer | None = None
 _isActive: bool = False
@@ -107,6 +115,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     jitterProbe = JitterProbe(membershipClient)
     await jitterProbe.start()
+
+    # Probe worker health on a fixed cadence so requests read a cache instead of
+    # probing inline (avoids the per-request health-probe storm under load).
+    asyncio.create_task(_health_monitor_loop())
 
     # Start leader election in background — does not block startup.
     asyncio.create_task(_leadershipLoop(membershipClient, myAddr))
@@ -310,7 +322,7 @@ async def listWorkers() -> list[dict[str, Any]]:
             measured = jitterProbe.get_jitter_ms(worker.node_id)
             if measured is not None:
                 worker.telemetry.jw = measured
-    health_by_node = await _worker_health_states(workers)
+    health_by_node = {worker.node_id: _cached_health(worker.node_id) for worker in workers}
     return [
         {
             "node_id": worker.node_id,
@@ -467,14 +479,48 @@ async def setWorkerWeightOverrides(payload: dict[str, Any]) -> dict[str, float]:
     return overrides
 
 
+async def _health_monitor_loop() -> None:
+    """Probe every worker's /health on a fixed cadence and cache the result.
+
+    Requests read this cache (see :func:`_cached_health`) instead of probing
+    /health inline, so a burst of N requests no longer fans out into
+    ``workers * N`` concurrent probes — which under load timed workers out and
+    dropped them from scheduling. The probe rate is fixed at
+    ``workers / HEALTH_PROBE_INTERVAL_SECONDS`` regardless of request rate.
+    """
+    global _health_cache
+    while True:
+        try:
+            if membershipClient is not None:
+                workers = await fetch_worker_snapshots(membershipClient)
+                states = await _worker_health_states(workers)
+                now = time.monotonic()
+                _health_cache = {node_id: (now, state) for node_id, state in states.items()}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Health monitor loop error")
+        await asyncio.sleep(HEALTH_PROBE_INTERVAL_SECONDS)
+
+
+def _cached_health(node_id: str) -> dict[str, Any]:
+    """Return the cached health for a worker, or unknown if missing/stale."""
+    entry = _health_cache.get(node_id)
+    if entry is None:
+        return _unknown_worker_health("not yet probed")
+    ts, state = entry
+    if time.monotonic() - ts > HEALTH_STALE_AFTER_SECONDS:
+        return _unknown_worker_health("health stale")
+    return state
+
+
 async def _ready_worker_snapshots(workers: Sequence[WorkerSnapshot]) -> list[WorkerSnapshot]:
-    """Return workers whose HTTP health reports an active inference engine."""
-    health_by_node = await _worker_health_states(workers)
-    return [
-        worker
-        for worker in workers
-        if health_by_node.get(worker.node_id, {}).get("healthy") is True
-    ]
+    """Return workers whose cached health reports an active inference engine.
+
+    Reads the background health cache, not an inline probe — so this is cheap and
+    constant regardless of how many requests are in flight.
+    """
+    return [worker for worker in workers if _cached_health(worker.node_id).get("healthy") is True]
 
 
 async def _worker_health_states(workers: Sequence[WorkerSnapshot]) -> dict[str, dict[str, Any]]:

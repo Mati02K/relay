@@ -155,6 +155,9 @@ def _run_locust(coordinator_url: str, results_dir: Path, shape: str) -> int:
         "--host", coordinator_url,
         "--headless",
         "--csv", csv_prefix,
+        # Per-endpoint rows per interval in _stats_history.csv (not just the
+        # aggregate) so latency and TTFT can be plotted separately over time.
+        "--csv-full-history",
     ]
     shape_params = {
         "ramp":      ["--run-time", "5m"],
@@ -168,39 +171,99 @@ def _run_locust(coordinator_url: str, results_dir: Path, shape: str) -> int:
     print(f"\nRunning locust ({shape}): {' '.join(cmd)}\n")
     result = subprocess.run(cmd, cwd=_REPO_ROOT, env=env)
 
-    # Generate locust plots if CSV files were produced
-    stats_file = Path(f"{csv_prefix}_stats.csv")
-    if stats_file.exists():
-        _plot_locust_results(stats_file, results_dir, shape)
+    # Plot latency + throughput over time from the stats-history CSV.
+    history_file = Path(f"{csv_prefix}_stats_history.csv")
+    if history_file.exists():
+        _plot_locust_results(history_file, results_dir, shape)
 
     return result.returncode
 
 
-def _plot_locust_results(stats_csv: Path, results_dir: Path, shape: str) -> None:
-    """Generate a TTFT-over-time plot from locust stats CSV if pandas is available."""
+def _plot_locust_results(history_csv: Path, results_dir: Path, shape: str) -> None:
+    """Emit three separate plots from a locust stats-history CSV (over time).
+
+    1. ``locust_<shape>_latency.png``    — full request P50/P90/P99 (the POST)
+    2. ``locust_<shape>_ttft.png``       — TTFT P90/P95/P99 (the SSE ``ttft`` event)
+    3. ``locust_<shape>_throughput.png`` — requests/sec + user count
+
+    The history file has one row per ~2s tick per endpoint (``/v1/chat/completions``,
+    ``ttft``) plus an ``Aggregated`` row. No-ops if matplotlib/pandas or the needed
+    columns are absent rather than failing the run.
+    """
     try:
         import matplotlib.pyplot as plt
         import pandas as pd
+    except ImportError:
+        return
 
-        df = pd.read_csv(stats_csv)
-        if "50%ile (ms)" not in df.columns:
+    df = pd.read_csv(history_csv)
+    if "Timestamp" not in df.columns or "Name" not in df.columns:
+        return
+    plots_dir = results_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    def _rows(name: str):  # type: ignore[no-untyped-def]
+        sub = df[df["Name"] == name].copy()
+        if sub.empty:
+            return None
+        ts = pd.to_numeric(sub["Timestamp"], errors="coerce")
+        sub["_t"] = ts - ts.iloc[0]
+        return sub
+
+    def _pct_plot(names, pcts, title, fname, ylabel):  # type: ignore[no-untyped-def]
+        sub = next((r for r in (_rows(n) for n in names) if r is not None), None)
+        if sub is None:
             return
-        fig, ax = plt.subplots(figsize=(12, 5))
-        for col, label in [("50%ile (ms)", "P50"), ("90%ile (ms)", "P90"), ("99%ile (ms)", "P99")]:
-            if col in df.columns:
-                ax.plot(df.index, df[col], label=label, linewidth=2)
-        ax.set_xlabel("Time bucket")
-        ax.set_ylabel("Response time (ms)")
-        ax.set_title(f"Locust {shape.title()} — Latency over Time")
-        ax.legend()
+        cols = [(c, lbl) for c, lbl in pcts if c in sub.columns]
+        if not cols:
+            return
+        fig, ax = plt.subplots(figsize=(11, 5))
+        for col, lbl in cols:
+            ax.plot(sub["_t"], pd.to_numeric(sub[col], errors="coerce"), label=lbl, linewidth=2)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(title="Percentile")
         ax.grid(True, alpha=0.4)
         fig.tight_layout()
-        out = results_dir / "plots" / f"locust_{shape}_latency.png"
+        out = plots_dir / fname
         fig.savefig(out, dpi=150)
         plt.close(fig)
-        print(f"  Locust plot saved: {out}")
-    except ImportError:
-        pass
+        print(f"  plot: {out}")
+
+    title = f"Locust {shape.title()}"
+    _pct_plot(("/v1/chat/completions", "Aggregated"),
+              [("50%", "P50"), ("90%", "P90"), ("99%", "P99")],
+              f"{title} — Request latency over time", f"locust_{shape}_latency.png",
+              "Response time (ms)")
+    _pct_plot(("ttft",), [("90%", "P90"), ("95%", "P95"), ("99%", "P99")],
+              f"{title} — TTFT over time", f"locust_{shape}_ttft.png", "TTFT (ms)")
+
+    # Throughput from the POST rows (the SSE event would double-count requests).
+    sub = _rows("/v1/chat/completions")
+    if sub is None:
+        sub = _rows("Aggregated")
+    rps_col = next((c for c in ("Requests/s", "Total Requests/s")
+                    if sub is not None and c in sub.columns), None)
+    if sub is not None and rps_col:
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.plot(sub["_t"], pd.to_numeric(sub[rps_col], errors="coerce"),
+                color="#388E3C", linewidth=2, label="Requests/s")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Requests/s")
+        if "User Count" in sub.columns:
+            ax2 = ax.twinx()
+            ax2.plot(sub["_t"], pd.to_numeric(sub["User Count"], errors="coerce"),
+                     color="gray", linestyle="--", alpha=0.6, label="Users")
+            ax2.set_ylabel("Users", color="gray")
+        ax.set_title(f"{title} — Throughput over time")
+        ax.grid(True, alpha=0.4)
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        out = plots_dir / f"locust_{shape}_throughput.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  plot: {out}")
 
 
 def _prepare_dataset() -> None:
