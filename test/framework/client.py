@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -30,6 +30,7 @@ class RoutingRecord:
     conversation_id: str = ""
     turn: int = 0
     error: str | None = None
+    category: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class RoutingRecord:
             "conversation_id": self.conversation_id,
             "turn": self.turn,
             "error": self.error,
+            "category": self.category,
         }
 
 
@@ -134,15 +136,13 @@ class RelayClient:
                     matched_tokens = int(
                         _parse_float(response.headers.get("x-relay-matched-tokens", "0"))
                     )
-                    attempts = int(
-                        _parse_float(response.headers.get("x-relay-attempts", "1"))
-                    )
+                    attempts = int(_parse_float(response.headers.get("x-relay-attempts", "1")))
 
                     async for raw_line in response.aiter_lines():
                         line = raw_line.strip()
                         if not line or not line.startswith("data: "):
                             continue
-                        payload = line[len("data: "):]
+                        payload = line[len("data: ") :]
                         if payload == "[DONE]":
                             break
                         if not first_content_seen and _has_content_delta(payload):

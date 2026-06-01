@@ -25,19 +25,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from framework.baseline import BASELINE_PHASE, run_round_robin_vs_signal
+from framework.baseline import BASELINE_PHASE, TelemetrySampler, run_round_robin_vs_signal
 from framework.client import RelayClient, RoutingRecord
 from framework.cluster import ClusterClient
 from framework.metrics import _percentile, save_records_csv, save_records_json, worker_share
 from framework.report import (
     plot_failure_counts,
     plot_latency_percentiles_comparison,
+    plot_signal_over_time,
     plot_worker_distribution_phases,
 )
 from framework.workload import send_batch
 
 SCENARIO = "queue"
 SIGNAL_PHASE = "queue_on"
+SIGNAL_FIELD = "qw"
 OVERLOAD_REQUESTS = int(os.getenv("RELAY_TEST_OVERLOAD_REQUESTS", "60"))
 OVERLOAD_CONCURRENCY = int(os.getenv("RELAY_TEST_OVERLOAD_CONCURRENCY", "30"))
 OVERLOAD_MAX_TOKENS = int(os.getenv("RELAY_TEST_OVERLOAD_MAX_TOKENS", "128"))
@@ -83,9 +85,10 @@ async def test_queue_routing_vs_round_robin(
             await _wait_idle(cluster)
             return records
 
-        baseline, signal = await run_round_robin_vs_signal(
-            cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
-        )
+        async with TelemetrySampler(cluster, SIGNAL_FIELD) as sampler:
+            baseline, signal = await run_round_robin_vs_signal(
+                cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
+            )
     finally:
         await client.aclose()
 
@@ -105,6 +108,7 @@ async def test_queue_routing_vs_round_robin(
     plot_latency_percentiles_comparison(
         {"round_robin": baseline, "queue_on": signal}, plots_dir, SCENARIO,
     )
+    plot_signal_over_time(sampler.samples, SIGNAL_FIELD, SCENARIO, plots_dir)
 
     # TTFT comparison (successful requests only) — the tail is where routing shows.
     rr_ttft = [r.ttft_ms for r in baseline if r.error is None]

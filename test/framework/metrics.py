@@ -11,7 +11,6 @@ from typing import Any
 
 from framework.client import RoutingRecord
 
-
 # ── Per-phase aggregation ─────────────────────────────────────────────────────
 
 def phase_stats(records: list[RoutingRecord], phase: str) -> dict[str, Any]:
@@ -60,6 +59,19 @@ def worker_share(records: list[RoutingRecord], node_id: str) -> float:
     return sum(1 for r in records if r.worker == node_id) / len(records)
 
 
+def routing_shift(a: list[RoutingRecord], b: list[RoutingRecord]) -> float:
+    """Total-variation distance between two runs' worker-share distributions (0–1).
+
+    0 means the two runs routed to workers in the same proportions; 1 means fully
+    disjoint placement. Node-agnostic. Used by the signal-importance ablation to
+    measure how much routing shifts when a cost-function term is removed.
+    """
+    nodes = {r.worker for r in a + b if r.worker}
+    if not nodes:
+        return 0.0
+    return 0.5 * sum(abs(worker_share(b, n) - worker_share(a, n)) for n in nodes)
+
+
 # ── Prefix-cache affinity ─────────────────────────────────────────────────────
 
 def conversation_affinity(records: list[RoutingRecord]) -> dict[str, Any]:
@@ -102,6 +114,39 @@ def throughput_rps(records: list[RoutingRecord]) -> float:
     t_max = max(r.timestamp + r.total_ms / 1000.0 for r in records)
     duration = t_max - t_min
     return len(records) / duration if duration > 0 else 0.0
+
+
+def bucket_series(
+    records: list[RoutingRecord],
+    run_start: float,
+    duration: float,
+    bucket_s: float = 2.0,
+) -> tuple[list[float], list[float], list[float]]:
+    """Bucket records by completion time into throughput and failure-rate series.
+
+    ``run_start`` is the ``time.perf_counter()`` reference the run was launched
+    with (records carry perf-counter timestamps). Returns ``(times, throughput,
+    failure_rate)`` where ``throughput`` is successful requests/sec per bucket and
+    ``failure_rate`` is errored/total per bucket. Used by the chaos charts to show
+    throughput collapse and failure spikes as workers are killed.
+    """
+    n = max(1, int(duration / bucket_s) + 1)
+    ok = [0] * n
+    err = [0] * n
+    for r in records:
+        done = r.timestamp + r.total_ms / 1000.0 - run_start
+        idx = int(done // bucket_s)
+        if 0 <= idx < n:
+            if r.error:
+                err[idx] += 1
+            else:
+                ok[idx] += 1
+    times = [(i + 0.5) * bucket_s for i in range(n)]
+    throughput = [ok[i] / bucket_s for i in range(n)]
+    failure_rate = [
+        err[i] / (ok[i] + err[i]) if (ok[i] + err[i]) > 0 else 0.0 for i in range(n)
+    ]
+    return times, throughput, failure_rate
 
 
 def latency_cdf(records: list[RoutingRecord]) -> dict[str, list[float]]:

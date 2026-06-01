@@ -23,18 +23,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from framework.baseline import run_round_robin_vs_signal
+from framework.baseline import TelemetrySampler, run_round_robin_vs_signal
 from framework.client import RelayClient
 from framework.cluster import ClusterClient
 from framework.metrics import save_records_csv, save_records_json, worker_share
-from framework.report import plot_worker_distribution_phases
+from framework.report import plot_signal_over_time, plot_worker_distribution_phases
 from framework.workload import send_batch
 
 SCENARIO = "jitter"
 SIGNAL_PHASE = "jitter_on"
-REQUESTS = int(os.getenv("RELAY_TEST_REQUESTS_PER_PHASE", "40"))
+SIGNAL_FIELD = "jw"
+REQUESTS = int(os.getenv("RELAY_TEST_REQUESTS_PER_PHASE", "60"))
 CONCURRENCY = 8
-MAX_TOKENS = int(os.getenv("RELAY_TEST_MAX_TOKENS", "8"))
+MAX_TOKENS = int(os.getenv("RELAY_TEST_MAX_TOKENS", "64"))
 EMA_SETTLE_SECONDS = float(os.getenv("RELAY_TEST_JITTER_SETTLE", "12"))
 SIGNAL_WEIGHTS = {
     "queue": 0.0, "prefix_miss": 0.0, "memory": 0.0, "jitter": 1.0, "thermal": 0.0, "nu": 0.0,
@@ -62,9 +63,10 @@ async def test_jitter_routing_vs_round_robin(
             concurrency=CONCURRENCY, max_tokens=MAX_TOKENS,
         )
 
-    baseline, signal = await run_round_robin_vs_signal(
-        cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
-    )
+    async with TelemetrySampler(cluster, SIGNAL_FIELD) as sampler:
+        baseline, signal = await run_round_robin_vs_signal(
+            cluster, run_workload, signal_phase=SIGNAL_PHASE, signal_weights=SIGNAL_WEIGHTS,
+        )
 
     print(f"\n[{SCENARIO}] worker share  round_robin → {SIGNAL_PHASE}  "
           f"(jitter-aware routing sends less to the jittery node):")
@@ -80,3 +82,4 @@ async def test_jitter_routing_vs_round_robin(
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
     plot_worker_distribution_phases(all_records, SCENARIO, plots_dir)
+    plot_signal_over_time(sampler.samples, SIGNAL_FIELD, SCENARIO, plots_dir)

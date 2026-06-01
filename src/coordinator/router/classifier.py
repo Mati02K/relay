@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_LENGTH_NORM_TOKENS = 2048
+DEFAULT_LENGTH_NORM_TOKENS = 256
 
 _COMPLEXITY_KEYWORDS: tuple[str, ...] = (
     "explain",
@@ -148,15 +148,18 @@ def estimate_complexity_score(
 ) -> float:
     """Return a [0, 1] heuristic complexity score for a prompt.
 
-    The score combines three signals, weighted equally between the
-    length signal and the lexical/structural signal:
+    The score combines a length signal and a lexical/structural signal,
+    weighted toward the lexical signal (which is what actually separates a
+    trivial lookup from a reasoning/coding task):
 
     * length signal: prompt token count divided by ``length_norm_tokens``
     * lexical signal: occurrences of reasoning keywords + code fences
     * structural signal: number of question marks
 
-    A real classifier (e.g. the fine-tuned BERT from the RouteLLM
-    paper) can replace this function while keeping the same signature.
+    Calibrated so realistic short prompts spread across ``[0, 1]`` (trivial
+    near 0, reasoning/coding well above 0.5) rather than clustering near 0.
+    A real classifier (e.g. the fine-tuned BERT from the RouteLLM paper) can
+    replace this function while keeping the same signature.
     """
     if not prompt_text:
         return 0.0
@@ -169,9 +172,9 @@ def estimate_complexity_score(
     code_blocks = lowered.count(_CODE_FENCE)
     questions = prompt_text.count("?")
     signal_raw = keyword_hits + 2 * code_blocks + 0.5 * questions
-    signal_score = min(1.0, signal_raw / 10.0)
+    signal_score = min(1.0, signal_raw / 4.0)
 
-    return min(1.0, 0.5 * length_score + 0.5 * signal_score)
+    return min(1.0, 0.4 * length_score + 0.6 * signal_score)
 
 
 def detect_skills(prompt_text: str) -> frozenset[str]:

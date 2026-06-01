@@ -42,6 +42,213 @@ def _sns():  # type: ignore[no-untyped-def]
 
 # ── Scheduler signal tests ────────────────────────────────────────────────────
 
+
+def plot_signal_outcome_bars(
+    values: dict[str, float],
+    noise: float,
+    output_dir: Path,
+    *,
+    filename: str,
+    title: str,
+    ylabel: str,
+) -> Path:
+    """Sorted bar chart of a per-signal outcome metric with a noise-floor line.
+
+    Bars above ``noise`` are green (a real effect beyond run-to-run wobble); bars
+    below it are grey (indistinguishable from noise). Used for the standalone-vs-
+    round-robin latency improvement, where higher = the signal helped more.
+    """
+    plt = _plt()
+    out = output_dir / filename
+    if not values:
+        return out
+
+    items = sorted(values.items(), key=lambda kv: kv[1], reverse=True)
+    names = [k for k, _ in items]
+    vals = [v for _, v in items]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    colors = ["#4caf50" if v > noise else "#bdbdbd" for v in vals]
+    bars = ax.bar(names, vals, color=colors)
+    ax.axhline(
+        noise,
+        color="#c0392b",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"noise floor (±{noise:.0f} ms)",
+    )
+    ax.axhline(0, color="black", linewidth=0.8)
+    for bar, v in zip(bars, vals, strict=True):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            v,
+            f"{v:+.0f}",
+            ha="center",
+            va="bottom" if v >= 0 else "top",
+            fontsize=9,
+        )
+
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def plot_cumulative_metric(
+    labels: list[str],
+    values: list[float],
+    output_dir: Path,
+    *,
+    filename: str,
+    title: str,
+    ylabel: str,
+) -> Path:
+    """Line chart of one metric as signals are switched on cumulatively over round-robin.
+
+    Used for both P90 TTFT (should staircase down) and throughput (should step up)
+    as each signal is added — a flat segment means that signal added nothing on top
+    of the earlier ones.
+    """
+    plt = _plt()
+    out = output_dir / filename
+    if not labels:
+        return out
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    ax.plot(labels, values, marker="o", linewidth=2, color="#1f77b4")
+    for x, y in zip(labels, values, strict=True):
+        ax.text(
+            x, y, f"{y:.0f}" if abs(y) >= 10 else f"{y:.2f}", ha="center", va="bottom", fontsize=9
+        )
+
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Signals enabled (cumulative)")
+    ax.set_title(title)
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+    plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def plot_pareto_signals(
+    impacts: dict[str, float],
+    output_dir: Path,
+    *,
+    filename: str = "signal_pareto.png",
+) -> Path:
+    """Pareto chart: each signal's 0–1 impact, sorted high→low, with a cumulative line.
+
+    Answers "which of the cost-function signals carries the routing?" — the 80/20
+    view. ``impacts`` maps signal name → score in [0, 1] (e.g. the leave-one-out
+    routing shift from ``test_signal_importance``).
+    """
+    plt = _plt()
+    out = output_dir / filename
+    if not impacts:
+        return out
+
+    items = sorted(impacts.items(), key=lambda kv: kv[1], reverse=True)
+    names = [k for k, _ in items]
+    values = [v for _, v in items]
+    total = sum(values) or 1.0
+    cumulative = []
+    running = 0.0
+    for v in values:
+        running += v
+        cumulative.append(running / total * 100)
+
+    fig, ax1 = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    colors = plt.cm.Set2.colors  # type: ignore[attr-defined]
+    bars = ax1.bar(names, values, color=[colors[i % len(colors)] for i in range(len(names))])
+    ax1.set_ylabel("Routing impact (0–1, measured in each signal's scenario)")
+    ax1.set_ylim(0, 1.05)
+    for bar, v in zip(bars, values, strict=True):
+        ax1.text(bar.get_x() + bar.get_width() / 2, v + 0.02, f"{v:.2f}", ha="center", fontsize=9)
+
+    ax2 = ax1.twinx()
+    ax2.plot(names, cumulative, color="#c0392b", marker="o", linewidth=2, label="cumulative %")
+    ax2.set_ylabel("Cumulative share of total impact (%)", color="#c0392b")
+    ax2.set_ylim(0, 110)
+    ax2.tick_params(axis="y", labelcolor="#c0392b")
+    for x, c in zip(names, cumulative, strict=True):
+        ax2.text(x, c + 2, f"{c:.0f}%", ha="center", color="#c0392b", fontsize=8)
+
+    ax1.set_title("Which signal matters? — per-signal routing impact (Pareto)")
+    fig.text(
+        0.5,
+        0.01,
+        "Conditional on the pressure each signal targets being present when its scenario ran.",
+        ha="center",
+        fontsize=8,
+        style="italic",
+        color="gray",
+    )
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+_SIGNAL_LABELS = {
+    "mw": "Memory pressure  m_w",
+    "theta_w": "Thermal pressure  θ_w",
+    "jw": "Jitter  j_w (ms)",
+    "qw": "Queue depth  q_w",
+}
+
+
+def plot_signal_over_time(
+    samples: list[tuple[float, dict[str, float]]],
+    field: str,
+    scenario: str,
+    output_dir: Path,
+) -> Path:
+    """Line chart of one telemetry field per worker over the whole test duration.
+
+    ``samples`` is ``[(elapsed_s, {node_id: value}), ...]`` as collected by
+    :class:`framework.baseline.TelemetrySampler`. Shows that the pressured node's
+    signal stayed elevated for the run, next to the routing-share result.
+    """
+    plt = _plt()
+    out = output_dir / f"{scenario}_{field}_over_time.png"
+    if not samples:
+        return out
+
+    nodes = sorted({n for _, row in samples for n in row})
+    times = [t for t, _ in samples]
+
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+    colors = plt.cm.Set2.colors  # type: ignore[attr-defined]
+    for i, node in enumerate(nodes):
+        ys = [row.get(node, 0.0) for _, row in samples]
+        ax.plot(times, ys, label=node, linewidth=2, color=colors[i % len(colors)])
+
+    ax.set_xlabel("Time since test start (s)")
+    ax.set_ylabel(_SIGNAL_LABELS.get(field, field))
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_title(
+        f"{scenario.replace('_', ' ').title()} — {_SIGNAL_LABELS.get(field, field)} per worker"
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Worker", bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 def plot_worker_distribution_phases(
     records: list[RoutingRecord],
     scenario: str,
@@ -61,9 +268,7 @@ def plot_worker_distribution_phases(
                 counts[record.worker] += 1
         total = sum(counts.values())
         shares_by_phase[phase] = (
-            {worker: count / total for worker, count in counts.items()}
-            if total
-            else {}
+            {worker: count / total for worker, count in counts.items()} if total else {}
         )
 
     all_workers = sorted({w for shares in shares_by_phase.values() for w in shares})
@@ -167,6 +372,7 @@ def plot_pressure_vs_routing(
 
 # ── Prefix cache ──────────────────────────────────────────────────────────────
 
+
 def plot_prefix_cache_heatmap(
     records: list[RoutingRecord],
     output_dir: Path,
@@ -208,8 +414,7 @@ def plot_prefix_cache_heatmap(
     ax.set_xlabel("Turn")
     ax.set_ylabel("Conversation")
     ax.set_title(
-        "Prefix Cache Affinity — Worker per Turn per Conversation\n"
-        "(same color = same worker)"
+        "Prefix Cache Affinity — Worker per Turn per Conversation\n(same color = same worker)"
     )
 
     out = output_dir / "prefix_cache_heatmap.png"
@@ -240,8 +445,7 @@ def plot_affinity_bars(
     ax.set_xlim(0, 105)
     ax.set_xlabel("Same-worker rate (%)")
     ax.set_title(
-        f"Prefix Cache Affinity per Conversation\n"
-        f"Overall: {result['overall_affinity'] * 100:.1f}%"
+        f"Prefix Cache Affinity per Conversation\nOverall: {result['overall_affinity'] * 100:.1f}%"
     )
     ax.legend()
     fig.tight_layout()
@@ -253,6 +457,7 @@ def plot_affinity_bars(
 
 
 # ── Quality routing ───────────────────────────────────────────────────────────
+
 
 def plot_quality_routing_scatter(
     records: list[RoutingRecord],
@@ -293,8 +498,12 @@ def plot_quality_routing_bins(
 ) -> Path:
     """Bar chart: strong-worker routing share per complexity bucket."""
     plt = _plt()
-    buckets = [(0.0, 0.25, "Low\n(0–0.25)"), (0.25, 0.5, "Med-Low\n(0.25–0.5)"),
-               (0.5, 0.75, "Med-High\n(0.5–0.75)"), (0.75, 1.01, "High\n(0.75–1.0)")]
+    buckets = [
+        (0.0, 0.25, "Low\n(0–0.25)"),
+        (0.25, 0.5, "Med-Low\n(0.25–0.5)"),
+        (0.5, 0.75, "Med-High\n(0.5–0.75)"),
+        (0.75, 1.01, "High\n(0.75–1.0)"),
+    ]
 
     shares = []
     labels = []
@@ -320,7 +529,69 @@ def plot_quality_routing_bins(
     return out
 
 
+def plot_routing_by_category(
+    records: list[RoutingRecord],
+    output_dir: Path,
+) -> Path:
+    """Heatmap of routing share per (prompt category x worker).
+
+    Rows are prompt categories, columns are workers; each cell is the fraction
+    of that category's successful requests that landed on the worker. A correct
+    router lights up one cell per row (each category → its intended model).
+    """
+    import numpy as np
+
+    plt = _plt()
+    ok = [r for r in records if not r.error and r.category and r.worker]
+
+    preferred_order = ("coding", "reasoning", "chat", "trivial")
+    present = {r.category for r in ok}
+    categories = [c for c in preferred_order if c in present]
+    categories += sorted(c for c in present if c not in preferred_order)
+    workers = sorted({r.worker for r in ok})
+
+    fig, ax = plt.subplots(
+        figsize=(max(_FIG_W, len(workers) * 1.6), max(4.0, len(categories) * 0.9))
+    )
+    if categories and workers:
+        matrix = np.zeros((len(categories), len(workers)))
+        for i, cat in enumerate(categories):
+            subset = [r for r in ok if r.category == cat]
+            for j, worker in enumerate(workers):
+                matrix[i, j] = worker_share(subset, worker)
+
+        im = ax.imshow(matrix, cmap="YlGnBu", vmin=0.0, vmax=1.0, aspect="auto")
+        ax.set_xticks(range(len(workers)))
+        ax.set_xticklabels(workers, rotation=20, ha="right")
+        ax.set_yticks(range(len(categories)))
+        ax.set_yticklabels(categories)
+        for i in range(len(categories)):
+            for j in range(len(workers)):
+                share = matrix[i, j]
+                ax.text(
+                    j,
+                    i,
+                    f"{share * 100:.0f}%",
+                    ha="center",
+                    va="center",
+                    color="white" if share > 0.55 else "black",
+                    fontsize=10,
+                )
+        fig.colorbar(im, ax=ax, label="share of category's requests")
+    else:
+        ax.text(0.5, 0.5, "no routed requests", ha="center", va="center")
+
+    ax.set_title("Routing share by prompt category")
+    fig.tight_layout()
+
+    out = output_dir / "routing_by_category.png"
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 # ── Baseline comparison ───────────────────────────────────────────────────────
+
 
 def plot_latency_cdf_comparison(
     records_by_config: dict[str, list[RoutingRecord]],
@@ -382,8 +653,7 @@ def plot_throughput_comparison(
     for pi, (pct, label) in enumerate([(50, "P50"), (90, "P90"), (99, "P99")]):
         vals = [_percentile([r.ttft_ms for r in records_by_config[c]], pct) for c in configs]
         offset = (pi - 1) * w
-        axes[1].bar([xi + offset for xi in x], vals, w, label=label,
-                    color=colors[pi])
+        axes[1].bar([xi + offset for xi in x], vals, w, label=label, color=colors[pi])
     axes[1].set_xticks(list(x))
     axes[1].set_xticklabels(configs)
     axes[1].set_ylabel("TTFT (ms)")
@@ -428,8 +698,14 @@ def plot_worker_heatmap_time(
 
     fig, ax = plt.subplots(figsize=(min(n_bins * 0.4 + 2, 18), max(3, len(workers) * 1.2)))
     bin_labels = [f"{i * window_seconds:.0f}s" for i in range(n_bins)]
-    sns.heatmap(matrix, ax=ax, xticklabels=bin_labels, yticklabels=workers,
-                cmap="Blues", cbar_kws={"label": "Requests"})
+    sns.heatmap(
+        matrix,
+        ax=ax,
+        xticklabels=bin_labels,
+        yticklabels=workers,
+        cmap="Blues",
+        cbar_kws={"label": "Requests"},
+    )
     ax.set_xlabel(f"Time window ({window_seconds:.0f}s bins)")
     ax.set_title(f"Worker Selection Over Time — {config}")
     fig.tight_layout()
@@ -441,6 +717,7 @@ def plot_worker_heatmap_time(
 
 
 # ── Failure comparison ────────────────────────────────────────────────────────
+
 
 def plot_failure_counts(
     counts: dict[str, int],
@@ -458,8 +735,14 @@ def plot_failure_counts(
     bars = ax.bar(labels, values, color=colors, edgecolor="white")
     for bar, value in zip(bars, values):
         annotation = f"{value}" + (f" / {total}" if total else "")
-        ax.text(bar.get_x() + bar.get_width() / 2, value, annotation,
-                ha="center", va="bottom", fontsize=12)
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            value,
+            annotation,
+            ha="center",
+            va="bottom",
+            fontsize=12,
+        )
 
     ax.set_ylabel("Failed requests (503 / timeout)")
     ax.set_ylim(0, max(values + [1]) * 1.25)
@@ -474,6 +757,7 @@ def plot_failure_counts(
 
 
 # ── TTFT percentiles ──────────────────────────────────────────────────────────
+
 
 def plot_latency_percentiles_comparison(
     records_by_label: dict[str, list[RoutingRecord]],
@@ -498,11 +782,18 @@ def plot_latency_percentiles_comparison(
         ttfts = [r.ttft_ms for r in records_by_label[label] if r.error is None]
         values = [_percentile(ttfts, pct) for pct, _ in pcts]
         offset = (i - len(labels) / 2 + 0.5) * width
-        bars = ax.bar([xi + offset for xi in x], values, width, label=label,
-                      color=colors[i % len(colors)])
+        bars = ax.bar(
+            [xi + offset for xi in x], values, width, label=label, color=colors[i % len(colors)]
+        )
         for bar, value in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2, value, f"{value:.0f}",
-                    ha="center", va="bottom", fontsize=8)
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                value,
+                f"{value:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
 
     ax.set_xticks(list(x))
     ax.set_xticklabels([name for _, name in pcts])
@@ -518,7 +809,112 @@ def plot_latency_percentiles_comparison(
     return out
 
 
+# ── Chaos / worker churn ──────────────────────────────────────────────────────
+
+_MODE_LABELS = {"cost": "Relay (cost)", "round_robin": "Round-robin"}
+_MODE_COLORS = {"cost": "#1976D2", "round_robin": "#C62828"}
+
+
+def _chaos_overlay(
+    series_by_mode: dict[str, tuple[list[float], list[float]]],
+    events: list[tuple[float, str]],
+    out: Path,
+    *,
+    title: str,
+    ylabel: str,
+    step: bool = False,
+    ymax: float | None = None,
+) -> Path:
+    """Overlay one metric per scheduler mode over run time, with kill/restore lines."""
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(_FIG_W, _FIG_H))
+
+    for mode, (xs, ys) in series_by_mode.items():
+        color = _MODE_COLORS.get(mode, None)
+        label = _MODE_LABELS.get(mode, mode)
+        if step:
+            ax.step(xs, ys, where="post", label=label, linewidth=2, color=color)
+        else:
+            ax.plot(xs, ys, label=label, linewidth=2, color=color)
+
+    for t, action in events:
+        ax.axvline(t, color="gray", linestyle="--", linewidth=1, alpha=0.6)
+        ax.text(
+            t,
+            0.98,
+            action,
+            transform=ax.get_xaxis_transform(),
+            rotation=90,
+            va="top",
+            ha="right",
+            fontsize=8,
+            color="dimgray",
+        )
+
+    ax.set_xlabel("Time since run start (s)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0, top=ymax)
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Scheduler")
+    fig.tight_layout()
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def plot_chaos_throughput(
+    series_by_mode: dict[str, tuple[list[float], list[float]]],
+    events: list[tuple[float, str]],
+    output_dir: Path,
+) -> Path:
+    """Throughput (successful req/s) over time, Relay vs round-robin overlaid."""
+    return _chaos_overlay(
+        series_by_mode,
+        events,
+        output_dir / "chaos_throughput.png",
+        title="Worker churn — throughput over time",
+        ylabel="Successful requests/s",
+    )
+
+
+def plot_chaos_failure_rate(
+    series_by_mode: dict[str, tuple[list[float], list[float]]],
+    events: list[tuple[float, str]],
+    output_dir: Path,
+) -> Path:
+    """Failure rate (errored/total per bucket) over time, both modes overlaid."""
+    return _chaos_overlay(
+        series_by_mode,
+        events,
+        output_dir / "chaos_failure_rate.png",
+        title="Worker churn — failure rate over time",
+        ylabel="Failure rate",
+        ymax=1.0,
+    )
+
+
+def plot_chaos_worker_count(
+    series_by_mode: dict[str, tuple[list[float], list[float]]],
+    events: list[tuple[float, str]],
+    output_dir: Path,
+) -> Path:
+    """Healthy worker count over time, both modes overlaid (step chart)."""
+    return _chaos_overlay(
+        series_by_mode,
+        events,
+        output_dir / "chaos_worker_count.png",
+        title="Worker churn — healthy workers over time",
+        ylabel="Healthy workers",
+        step=True,
+    )
+
+
 # ── Summary JSON ──────────────────────────────────────────────────────────────
+
 
 def save_summary(
     run_dir: Path,

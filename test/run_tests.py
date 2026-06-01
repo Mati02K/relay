@@ -19,6 +19,7 @@ Flags
   --signals      All scheduler signal scenario tests
   --compare      Relay vs round-robin vs single-worker
   --load         Locust load tests (ramp, spike, sustained — or specify --shape)
+  --chaos        Interactive worker-churn resilience test (manual kills; --rps/--duration)
   --scenarios S  Comma-separated or space-separated list:
                  memory thermal jitter queue prefix_cache quality_routing
   --shape NAME   Locust shape to run: ramp | spike | sustained (default: ramp)
@@ -57,6 +58,13 @@ def main() -> None:
     parser.add_argument("--signals", action="store_true", help="Run all signal scenarios")
     parser.add_argument("--compare", action="store_true", help="Run baseline comparison")
     parser.add_argument("--load", action="store_true", help="Run locust load tests")
+    parser.add_argument("--chaos", action="store_true",
+                        help="Run the interactive worker-churn resilience test "
+                             "(constant load, manual kills, cost vs round-robin)")
+    parser.add_argument("--rps", type=float, default=5.0,
+                        help="Chaos: constant arrival rate in req/s (default: 5)")
+    parser.add_argument("--duration", type=float, default=300.0,
+                        help="Chaos: seconds per mode run (default: 300)")
     parser.add_argument("--shape", choices=["ramp", "spike", "sustained", "all"],
                         default="ramp", help="Locust load shape (default: ramp)")
     parser.add_argument("--all", action="store_true", help="Run everything")
@@ -109,8 +117,13 @@ def main() -> None:
             code = _run_locust(args.coordinator, results_dir, shape)
             exit_codes.append(code)
 
+    # ── Chaos / worker-churn resilience test (interactive; not part of --all) ──
+    if args.chaos:
+        code = _run_chaos(args, results_dir)
+        exit_codes.append(code)
+
     # ── Default: if nothing selected, run signal tests ────────────────────────
-    if not test_paths and not (run_all or args.load):
+    if not test_paths and not (run_all or args.load or args.chaos):
         print("No tests selected. Running all signal scenarios by default.")
         code = _run_pytest(args, results_dir, [str(_TEST_DIR / "scenarios")])
         exit_codes.append(code)
@@ -144,6 +157,34 @@ def _run_pytest(
 
     print(f"\nRunning pytest: {' '.join(cmd)}\n")
     result = subprocess.run(cmd, cwd=_REPO_ROOT)
+    return result.returncode
+
+
+def _run_chaos(args: argparse.Namespace, results_dir: Path) -> int:
+    """Run the worker-churn chaos test, passing rps/duration through the environment."""
+    import os
+
+    cmd = [
+        sys.executable, "-m", "pytest",
+        f"--coordinator={args.coordinator}",
+        f"--results-dir={results_dir}",
+        "--tb=short",
+        "--asyncio-mode=auto",
+        "-s",
+        str(_TEST_DIR / "chaos"),
+    ]
+    if args.model:
+        cmd.append(f"--model={args.model}")
+    if args.verbose:
+        cmd.append("-v")
+
+    env = {
+        **os.environ,
+        "RELAY_CHAOS_RPS": str(args.rps),
+        "RELAY_CHAOS_DURATION": str(args.duration),
+    }
+    print(f"\nRunning chaos (worker churn): {' '.join(cmd)}\n")
+    result = subprocess.run(cmd, cwd=_REPO_ROOT, env=env)
     return result.returncode
 
 
