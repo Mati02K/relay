@@ -143,6 +143,7 @@ class WorkerDaemon:
             "models": models,
             "prefix_cache": telemetry.prefix_cache.model_dump(),
             "weight": self.weight,
+            "queue_capacity": self.inference_engine.queue_capacity,
         }
         await self.membership.holdLease(WORKER_LEASE_TTL_SECONDS)
         await self.membership.register(self.node_id, metadata)

@@ -61,11 +61,12 @@ from telemetry.prefix_cache import (
 )
 
 DEFAULT_JITTER_MAX_MS = float(os.getenv("RELAY_SCHED_JITTER_MAX_MS", "1.0"))
-# Queue depth (q_w) enters the cost raw: the term is ``queue_weight * q_w`` with
-# no normalization or clamp, so a deep backlog keeps driving the decision instead
-# of saturating at 1.0. q_w must be total in-flight (running + waiting) from every
-# engine for cross-engine comparison; tune ``queue_weight`` to set its scale
-# against the other [0, 1] signals.
+# Queue depth (q_w) is normalized with a saturating curve, q_w / (q_w + capacity),
+# where capacity is the worker's own concurrency (its parallel slots, advertised in
+# metadata). This keeps the term in [0, 1) like the other signals, stays monotonic
+# in q_w so deeper backlogs still cost more (no hard clamp), and makes a 1-slot and
+# a 4-slot engine comparable. q_w is the coordinator's in-flight count for the worker.
+DEFAULT_QUEUE_CAPACITY = 1
 
 
 @dataclass
@@ -362,7 +363,9 @@ def _score_worker(
     overlap = _prefix_overlap(matched_tokens, prompt_tokens)
 
     weights = WEIGHTS
-    queue_term = weights.queue * max(0, telemetry.qw)
+    queue_depth = max(0, telemetry.qw)
+    normalized_queue = queue_depth / (queue_depth + _queue_capacity(worker))
+    queue_term = weights.queue * normalized_queue
     prefix_term = weights.prefix_miss * (1.0 - overlap)
     memory_term = weights.memory * telemetry.mw
     jitter_term = weights.jitter * telemetry.jw / jitter_max
@@ -492,6 +495,15 @@ def _jitter_max(workers: Sequence[WorkerSnapshot]) -> float:
     """Return ``j_max`` for the current candidate set."""
     observed = max((worker.telemetry.jw for worker in workers), default=0.0)
     return max(observed, DEFAULT_JITTER_MAX_MS, 1e-6)
+
+
+def _queue_capacity(worker: WorkerSnapshot) -> int:
+    """Worker's concurrency (parallel slots) used to normalize queue depth."""
+    raw = worker.metadata.get("queue_capacity", DEFAULT_QUEUE_CAPACITY)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_QUEUE_CAPACITY
 
 
 def _requested_model(request: Mapping[str, object]) -> str | None:

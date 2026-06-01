@@ -47,3 +47,11 @@ class InferenceEngine(ABC):
     def uses_gpu(self) -> bool:
         """Whether the active model is currently offloaded (partially or fully) to a GPU."""
         return True
+
+    @property
+    def queue_capacity(self) -> int:
+        """Requests this engine serves concurrently; used to normalize queue depth.
+
+        Defaults to 1 (serial); backends with parallel slots override this.
+        """
+        return 1

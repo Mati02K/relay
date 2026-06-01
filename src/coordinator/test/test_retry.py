@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import pytest
 
+from coordinator import inflight
 from coordinator.main import (
     OpenedStream,
     WorkerUnreachable,
@@ -15,6 +16,19 @@ from coordinator.scheduler import SchedulingError
 from coordinator.worker_registry import WorkerSnapshot
 from telemetry.prefix_cache import PrefixHashConfig
 from telemetry.schemas import PrefixCacheTelemetry, Telemetry
+
+
+@pytest.fixture(autouse=True)
+def _reset_inflight() -> Any:
+    """Clear coordinator in-flight counts so reservations don't leak across tests.
+
+    ``_open_stream_with_retry`` reserves on the chosen worker; the matching
+    release lives in the streaming generator, which these unit tests don't drive,
+    so the global counter must be reset around each test.
+    """
+    inflight.reset()
+    yield
+    inflight.reset()
 
 
 def test_first_worker_reachable_returns_attempt_one() -> None:

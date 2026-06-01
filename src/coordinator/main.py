@@ -15,6 +15,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 import logger as loggerSetup
+from coordinator import inflight
 from coordinator import scheduler as scheduler_module
 from coordinator.scheduler import SchedulingError, WorkerChoice, choose_worker
 from coordinator.worker_registry import WorkerSnapshot, fetch_worker_snapshots
@@ -227,7 +228,9 @@ async def chatCompletions(request: Request) -> StreamingResponse:
     )
 
     return StreamingResponse(
-        _streamWorkerResponse(opened.client, opened.stream_ctx, opened.upstream),
+        _streamWorkerResponse(
+            opened.client, opened.stream_ctx, opened.upstream, choice.worker.node_id
+        ),
         media_type="text/event-stream",
         headers={
             "X-Relay-Worker": choice.worker.node_id,
@@ -299,8 +302,11 @@ async def listWorkers() -> list[dict[str, Any]]:
     _requireActive()
     assert membershipClient is not None
     workers = await fetch_worker_snapshots(membershipClient)
-    if jitterProbe is not None:
-        for worker in workers:
+    for worker in workers:
+        # Show the coordinator's live in-flight count as qw — the same signal the
+        # scheduler routes on — rather than the now-unused worker-published value.
+        worker.telemetry.qw = inflight.depth(worker.node_id)
+        if jitterProbe is not None:
             measured = jitterProbe.get_jitter_ms(worker.node_id)
             if measured is not None:
                 worker.telemetry.jw = measured
@@ -664,18 +670,26 @@ async def _open_stream_with_retry(
     last_error: WorkerUnreachable | None = None
     for attempt in range(1, max_attempts + 1):
         candidates = [worker for worker in workers if worker.node_id not in tried]
+        # Queue signal is coordinator-owned: overwrite the worker-published qw
+        # with our live in-flight count. Read synchronously here so concurrent
+        # requests observe each other's reservations and don't stampede one
+        # worker; keep read -> choose -> reserve free of awaits.
+        for worker in candidates:
+            worker.telemetry.qw = inflight.depth(worker.node_id)
         try:
             choice = choose_worker(body, candidates)
         except SchedulingError:
             if last_error is not None:
                 raise last_error
             raise
+        inflight.reserve(choice.worker.node_id)
         try:
             opened = await open_fn(choice.worker)
         except WorkerUnreachable as e:
-            # Trust the worker we just picked, not the exception payload — the
-            # set must reflect what we actually tried, not whatever the opener
-            # decided to put in the exception.
+            # Release the reservation for the worker that failed to open, then
+            # trust the worker we just picked (not the exception payload) — the
+            # set must reflect what we actually tried.
+            inflight.release(choice.worker.node_id)
             tried.add(choice.worker.node_id)
             last_error = e
             logger.warning(
@@ -695,11 +709,16 @@ async def _streamWorkerResponse(
     client: httpx.AsyncClient,
     stream_ctx: AbstractAsyncContextManager[httpx.Response],
     upstream: httpx.Response,
+    nodeId: str,
 ) -> AsyncIterator[bytes]:
     try:
         async for chunk in upstream.aiter_bytes():
             yield chunk
     finally:
+        # Release the in-flight reservation only once the request has fully
+        # completed — including client disconnect or a mid-stream error, both of
+        # which run this finally — never at first byte.
+        inflight.release(nodeId)
         await stream_ctx.__aexit__(
             None,
             None,

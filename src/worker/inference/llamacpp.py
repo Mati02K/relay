@@ -109,6 +109,11 @@ class LlamaCppEngine(InferenceEngine):
         """``n_gpu_layers != 0`` means at least one transformer layer runs on GPU."""
         return self._n_gpu_layers != 0
 
+    @property
+    def queue_capacity(self) -> int:
+        """Concurrent inference slots — the ``--parallel`` value llama-server runs with."""
+        return self._n_parallel
+
     async def start(self) -> None:
         """Spawn ``llama-server`` if not already running (idempotent)."""
         async with self._lock:
