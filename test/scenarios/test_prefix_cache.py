@@ -91,8 +91,6 @@ def _plot_affinity_comparison(rr_affinity: dict, sig_affinity: dict, plots_dir: 
     consistent it is (prefix-on dots cluster at 100%, round-robin dots scatter low).
     """
     try:
-        import random as _random
-
         import matplotlib.pyplot as plt
     except ImportError:
         return
@@ -100,10 +98,6 @@ def _plot_affinity_comparison(rr_affinity: dict, sig_affinity: dict, plots_dir: 
     labels = ["round-robin", "prefix on"]
     colors = ["#EF5350", "#42A5F5"]
     overalls = [rr_affinity["overall_affinity"] * 100, sig_affinity["overall_affinity"] * 100]
-    per_conv = [
-        [v * 100 for v in rr_affinity["per_conversation"].values()],
-        [v * 100 for v in sig_affinity["per_conversation"].values()],
-    ]
     x = [0, 1]
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -112,18 +106,12 @@ def _plot_affinity_comparison(rr_affinity: dict, sig_affinity: dict, plots_dir: 
         ax.text(xi, value + 1.5, f"{value:.1f}%", ha="center", va="bottom",
                 fontsize=14, fontweight="bold")
 
-    rng = _random.Random(42)
-    for xi, values in zip(x, per_conv):
-        xs = [xi + rng.uniform(-0.13, 0.13) for _ in values]
-        ax.scatter(xs, values, color="white", edgecolor="#333", s=32, zorder=3, alpha=0.85)
-
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=12)
     ax.set_ylabel("Same-worker rate (%)")
     ax.set_ylim(0, 112)
     ax.set_title(
-        "Prefix Cache Affinity — round-robin vs prefix on\n"
-        "(bar = overall · dots = per conversation)"
+        "Prefix Cache Affinity — round-robin vs prefix on"
     )
     fig.tight_layout()
     fig.savefig(plots_dir / "prefix_cache_affinity_comparison.png", dpi=150)
