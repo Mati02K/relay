@@ -1,12 +1,11 @@
-import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from loguru import logger
 
 import logger as loggerSetup
+from middleware import log_requests
 from worker.daemon import WorkerDaemon
 
 
@@ -31,20 +30,7 @@ def _worker(request: Request) -> WorkerDaemon:
     return worker
 
 
-@app.middleware("http")
-async def logRequests(request: Request, callNext: object) -> Response:
-    """Log every incoming request with response status and duration."""
-    start = time.perf_counter()
-    response: Response = await callNext(request)  # type: ignore[operator]
-    duration = (time.perf_counter() - start) * 1000
-    logger.info(
-        "{} {} -> {} | {:.1f}ms",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration,
-    )
-    return response
+app.middleware("http")(log_requests)
 
 
 @app.get("/health")

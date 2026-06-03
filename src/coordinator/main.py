@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, AsyncIterator, cast
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
@@ -20,6 +20,7 @@ from coordinator import scheduler as scheduler_module
 from coordinator.scheduler import SchedulingError, WorkerChoice, choose_worker
 from coordinator.worker_registry import WorkerSnapshot, fetch_worker_snapshots
 from membership.etcd import EtcdMembership
+from middleware import log_requests
 from network import NetworkLayer, build_network
 from telemetry.jitter import JitterProbe
 
@@ -136,20 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Relay Coordinator", lifespan=lifespan)
 
 
-@app.middleware("http")
-async def logRequests(request: Request, callNext: object) -> Response:
-    """Log every incoming HTTP request with response status and duration."""
-    start = time.perf_counter()
-    response: Response = await callNext(request)  # type: ignore[operator]
-    duration = (time.perf_counter() - start) * 1000
-    logger.info(
-        "{} {} -> {} | {:.1f}ms",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration,
-    )
-    return response
+app.middleware("http")(log_requests)
 
 
 def _requireActive() -> None:
