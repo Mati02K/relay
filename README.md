@@ -38,7 +38,7 @@ scheduling automatically.
 
 ## Prerequisites
 
-- Python 3.12+
+- Python 3.11+
 - `uv`
 - Network access for first-time downloads (models, runtime binaries)
 
@@ -69,7 +69,7 @@ uv --version
 
 ```bash
 git clone <repo-url>
-cd Relay
+cd relay
 uv venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 uv pip install -e ".[dev]"
@@ -581,11 +581,19 @@ Logs:
 ## Development Commands
 
 ```bash
-.venv/bin/python -m compileall src
-.venv/bin/ruff check src
-.venv/bin/ruff format --check src
-.venv/bin/mypy src/relay src/coordinator src/telemetry src/worker/daemon.py src/worker/main.py src/worker/inference
-.venv/bin/pytest src/relay/test/test_init.py
+python -m compileall src         # syntax check all source
+ruff check src                   # lint
+ruff format --check src          # format check
+mypy src/                        # strict type check (see pyproject.toml)
+pytest src/relay/test/           # unit tests
+```
+
+Or via `make`:
+
+```bash
+make lint        # ruff check + format
+make typecheck   # mypy src/
+make proto       # regenerate gRPC stubs (Python + Go)
 ```
 
 ---
@@ -657,3 +665,14 @@ curl http://COORD_IP:8080/v1/models   # see what the cluster has
 
 Expected — `llama-server` starts lazily on the first inference call. Subsequent
 requests on the same worker reuse the running process.
+
+---
+
+## Further Reading
+
+- [`SCHEDULER.md`](SCHEDULER.md) — cost function design, signal weights, and
+  scheduling theory.
+- [`src/coordinator/router/README.md`](src/coordinator/router/README.md) —
+  quality and modality routing.
+- [`test/README.md`](test/README.md) — integration/scenario test framework and
+  benchmark methodology.
